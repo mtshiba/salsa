@@ -51,7 +51,7 @@ pub trait Configuration: Any {
     type Input<'db>: Send + Sync;
 
     /// The value computed by the function.
-    type Output<'db>: Send + Sync;
+    type Output<'db>: Send + Sync + std::fmt::Debug;
 
     /// Determines whether this function can recover from being a participant in a cycle
     /// (and, if so, how).

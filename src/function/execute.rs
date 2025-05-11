@@ -178,7 +178,7 @@ where
                         // this query that it doesn't evaluate to, given its inputs). Maybe we'll
                         // have to go with the latter, but for now let's panic and see if real use
                         // cases need non-converging fallbacks.
-                        panic!("{database_key_index:?}: execute: fallback did not converge");
+                        panic!("{database_key_index:?}: execute: fallback did not converge ({new_value:?} != {last_provisional_value:?})");
                     }
                     // We are in a cycle that hasn't converged; ask the user's
                     // cycle-recovery function what to do:
@@ -206,7 +206,7 @@ where
                     // which is less than `u32::MAX`.
                     iteration_count += 1;
                     if iteration_count > MAX_ITERATIONS {
-                        panic!("{database_key_index:?}: execute: too many cycle iterations");
+                        panic!("{database_key_index:?}: execute: too many cycle iterations ({new_value:?} != {last_provisional_value:?})");
                     }
                     zalsa.event(&|| {
                         Event::new(EventKind::WillIterateCycle {
