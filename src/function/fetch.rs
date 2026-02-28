@@ -5,7 +5,7 @@ use crate::function::sync::ClaimResult;
 use crate::function::{Configuration, IngredientImpl, Reentrancy};
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::{QueryRevisions, ZalsaLocal};
-use crate::{DatabaseKeyIndex, Id};
+use crate::{tracing, DatabaseKeyIndex, Id};
 
 impl<C> IngredientImpl<C>
 where
@@ -28,11 +28,31 @@ where
 
         let memo = self.refresh_memo(db, zalsa, zalsa_local, id);
 
-        // SAFETY: We just refreshed the memo so it is guaranteed to contain a value now.
-        let memo_value = unsafe { memo.value.as_ref().unwrap_unchecked() };
+        // JACOBI: In Jacobi mode, use the snapshot VALUE (previous iteration) if available,
+        // but always report metadata (cycle_heads, durability, changed_at) from the LATEST memo.
+        // This is critical: snapshot memos have stale cycle_heads with old iteration counts,
+        // which would cause assertion failures when merged with current-iteration cycle_heads.
+        // However, if the memo has been finalized (e.g., an inner cycle converged), use the
+        // finalized value—not the stale snapshot from before the inner cycle ran.
+        let memo_value = if zalsa_local.is_jacobi_mode() && memo.may_be_provisional() {
+            let memo_ingredient_index = self.memo_ingredient_index(zalsa, id);
+            if let Some(snapshot) =
+                self.get_jacobi_snapshot(zalsa, id, memo_ingredient_index)
+            {
+                // SAFETY: Snapshot was saved before re-execution, guaranteed to have a value.
+                unsafe { snapshot.value.as_ref().unwrap_unchecked() }
+            } else {
+                // SAFETY: We just refreshed the memo so it is guaranteed to contain a value now.
+                unsafe { memo.value.as_ref().unwrap_unchecked() }
+            }
+        } else {
+            // SAFETY: We just refreshed the memo so it is guaranteed to contain a value now.
+            unsafe { memo.value.as_ref().unwrap_unchecked() }
+        };
 
         self.eviction.record_use(id);
 
+        // Always report from the latest memo (not the snapshot) to get correct cycle_heads.
         zalsa_local.report_tracked_read(
             database_key_index,
             memo.revisions.durability,
@@ -146,6 +166,18 @@ where
                     return unsafe { Some(self.extend_memo_lifetime(old_memo)) };
                 }
 
+                // JACOBI: Save snapshot before re-execution so we can return
+                // the previous iteration's value to other queries.
+                if zalsa_local.is_jacobi_mode()
+                    && old_memo.may_be_provisional()
+                    && old_memo.verified_at.load() == zalsa.current_revision()
+                {
+                    tracing::debug!(
+                        "{database_key_index:?}: saving Jacobi snapshot before re-execution"
+                    );
+                    self.set_jacobi_snapshot(zalsa, id, memo_ingredient_index, old_memo);
+                }
+
                 let verify_result = self.deep_verify_memo(db, zalsa, old_memo, database_key_index);
 
                 if verify_result.is_unchanged() {
@@ -156,7 +188,29 @@ where
             }
         }
 
-        self.execute(db, claim_guard, opt_old_memo)
+        let result = self.execute(db, claim_guard, opt_old_memo);
+
+        // JACOBI: After re-execution, check if the non-head participant converged
+        if zalsa_local.is_jacobi_mode() {
+            if let Some(snapshot) = self.get_jacobi_snapshot(zalsa, id, memo_ingredient_index) {
+                if let Some(new_memo) =
+                    self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)
+                {
+                    if let (Some(old_v), Some(new_v)) =
+                        (snapshot.value.as_ref(), new_memo.value.as_ref())
+                    {
+                        if !C::values_equal(old_v, new_v) {
+                            tracing::debug!(
+                                "{database_key_index:?}: Jacobi non-head value changed"
+                            );
+                            zalsa_local.set_jacobi_all_converged(false);
+                        }
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     #[cold]

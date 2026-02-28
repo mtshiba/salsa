@@ -88,6 +88,12 @@ fn the_test() {
             "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
             "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(3) })",
             "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
-            "salsa_event(DidFinalizeCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(3) })",
+            "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(4) })",
+            "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
+            "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(5) })",
+            "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
+            "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(6) })",
+            "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
+            "salsa_event(DidFinalizeCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(6) })",
         ]"#]]);
 }

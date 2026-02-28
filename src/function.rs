@@ -14,6 +14,7 @@ use crate::hash::{FxHashSet, FxIndexSet};
 use crate::ingredient::{Ingredient, WaitForResult};
 use crate::key::DatabaseKeyIndex;
 use crate::plumbing::{self, MemoIngredientMap};
+use crate::revision::AtomicRevision;
 use crate::salsa_struct::SalsaStructInDb;
 use crate::sync::Arc;
 use crate::table::memo::MemoTableTypes;
@@ -200,6 +201,12 @@ pub struct IngredientImpl<C: Configuration> {
     /// we don't know that we can trust the database to give us the same runtime
     /// everytime and so forth.
     deleted_entries: DeletedEntries<C>,
+
+    /// The revision in which Jacobi snapshots were last set.
+    /// Snapshots are only valid when this matches the current revision.
+    /// This prevents accessing dangling pointers after `deleted_entries.clear()`
+    /// frees the old memos in a new revision.
+    jacobi_snapshot_revision: AtomicRevision,
 }
 
 impl<C> IngredientImpl<C>
@@ -218,6 +225,7 @@ where
             deleted_entries: Default::default(),
             view_caster: OnceLock::new(),
             sync_table: SyncTable::new(index),
+            jacobi_snapshot_revision: AtomicRevision::start(),
         }
     }
 

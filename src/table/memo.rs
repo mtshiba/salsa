@@ -38,6 +38,7 @@ impl MemoTable {
             *memo = MemoEntry::default();
         }
     }
+
 }
 
 pub trait Memo: Any + Send + Sync {
@@ -71,6 +72,12 @@ pub trait Memo: Any + Send + Sync {
 struct MemoEntry {
     /// An [`AtomicPtr`][] to a `Box<M>` for the erased memo type `M`
     atomic_memo: AtomicPtr<DummyMemo>,
+
+    /// Jacobi iteration snapshot: points to the previous iteration's memo.
+    /// This is a non-owning pointer; the actual memo is kept alive by
+    /// `DeletedEntries` or still lives in `atomic_memo`.
+    /// Only used during fixpoint cycle iteration.
+    jacobi_snapshot: AtomicPtr<DummyMemo>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,7 +195,7 @@ impl MemoTableWithTypes<'_> {
         memo_ingredient_index: MemoIngredientIndex,
         memo: NonNull<M>,
     ) -> Option<NonNull<M>> {
-        let MemoEntry { atomic_memo } = self.memos.memos.get(memo_ingredient_index.as_usize())?;
+        let MemoEntry { atomic_memo, jacobi_snapshot: _ } = self.memos.memos.get(memo_ingredient_index.as_usize())?;
 
         // SAFETY: Any indices that are in-bounds for the `MemoTable` are also in-bounds for its
         // corresponding `MemoTableTypes`, by construction.
@@ -210,12 +217,37 @@ impl MemoTableWithTypes<'_> {
     }
 
     /// Returns a pointer to the memo at the given index, if one has been inserted.
+    /// Sets the Jacobi snapshot pointer for the given memo ingredient index.
+    /// The pointer must remain valid for the lifetime of the current revision
+    /// (ensured by `DeletedEntries` keeping the old memo alive).
+    pub(crate) fn set_jacobi_snapshot<M: Memo>(
+        &self,
+        memo_ingredient_index: MemoIngredientIndex,
+        memo: NonNull<M>,
+    ) {
+        if let Some(entry) = self.memos.memos.get(memo_ingredient_index.as_usize()) {
+            entry
+                .jacobi_snapshot
+                .store(MemoEntryType::to_dummy(memo).as_ptr(), Ordering::Release);
+        }
+    }
+
+    /// Gets the Jacobi snapshot pointer, if one has been set.
+    pub(crate) fn get_jacobi_snapshot<M: Memo>(
+        &self,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> Option<NonNull<M>> {
+        let entry = self.memos.memos.get(memo_ingredient_index.as_usize())?;
+        NonNull::new(entry.jacobi_snapshot.load(Ordering::Acquire))
+            .map(|memo| unsafe { MemoEntryType::from_dummy(memo) })
+    }
+
     #[inline]
     pub(crate) fn get<M: Memo>(
         self,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Option<NonNull<M>> {
-        let MemoEntry { atomic_memo } = self.memos.memos.get(memo_ingredient_index.as_usize())?;
+        let MemoEntry { atomic_memo, jacobi_snapshot: _ } = self.memos.memos.get(memo_ingredient_index.as_usize())?;
 
         // SAFETY: Any indices that are in-bounds for the `MemoTable` are also in-bounds for its
         // corresponding `MemoTableTypes`, by construction.
@@ -270,7 +302,7 @@ impl MemoTableWithTypesMut<'_> {
         memo_ingredient_index: MemoIngredientIndex,
         f: impl FnOnce(&mut M),
     ) {
-        let Some(MemoEntry { atomic_memo }) =
+        let Some(MemoEntry { atomic_memo, jacobi_snapshot: _ }) =
             self.memos.memos.get_mut(memo_ingredient_index.as_usize())
         else {
             return;
@@ -349,6 +381,9 @@ impl MemoEntry {
     /// The type must match.
     #[inline]
     unsafe fn take(&mut self, type_: &MemoEntryType) -> Option<Box<dyn Memo>> {
+        // Clear the jacobi snapshot pointer. It is non-owning, so we don't free it.
+        *self.jacobi_snapshot.get_mut() = ptr::null_mut();
+
         let memo = mem::replace(self.atomic_memo.get_mut(), ptr::null_mut());
         let memo = NonNull::new(memo)?;
         // SAFETY: Our preconditions.

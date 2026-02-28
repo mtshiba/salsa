@@ -1,4 +1,4 @@
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
 use std::fmt::Formatter;
 use std::panic::UnwindSafe;
@@ -43,6 +43,18 @@ pub struct ZalsaLocal {
     most_recent_pages: UnsafeCell<FxHashMap<IngredientIndex, PageIndex>>,
 
     cancelled: CancellationToken,
+
+    /// Tracks the nesting depth of fixpoint cycle iterations.
+    /// Jacobi semantics (return snapshot / previous-iteration values) are
+    /// active only at depth 1 (the outermost cycle head). Inner (nested)
+    /// cycle heads increment the depth further, disabling Jacobi so they
+    /// converge with Gauss-Seidel semantics.
+    jacobi_cycle_depth: Cell<u32>,
+
+    /// Tracks whether all non-head cycle participants have converged
+    /// during the current iteration. Reset to `true` at the start of
+    /// each iteration; set to `false` if any participant's value changed.
+    jacobi_all_converged: Cell<bool>,
 }
 
 /// A cancellation token that can be used to cancel a query computation for a specific local `Database`.
@@ -88,6 +100,8 @@ impl ZalsaLocal {
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             cancelled: CancellationToken::default(),
+            jacobi_cycle_depth: Cell::new(0),
+            jacobi_all_converged: Cell::new(true),
         }
     }
 
@@ -431,6 +445,42 @@ impl ZalsaLocal {
     #[inline]
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancelled.clone()
+    }
+
+    /// Returns whether we are currently in Jacobi iteration mode.
+    /// Jacobi is active only at depth 1 (the outermost fixpoint cycle).
+    #[inline]
+    pub(crate) fn is_jacobi_mode(&self) -> bool {
+        self.jacobi_cycle_depth.get() == 1
+    }
+
+    /// Increments the Jacobi cycle depth. Called when entering a fixpoint
+    /// cycle iteration (both outermost and nested cycle heads).
+    #[inline]
+    pub(crate) fn enter_jacobi_cycle(&self) {
+        self.jacobi_cycle_depth.set(self.jacobi_cycle_depth.get() + 1);
+    }
+
+    /// Decrements the Jacobi cycle depth. Called when leaving a fixpoint
+    /// cycle iteration.
+    #[inline]
+    pub(crate) fn leave_jacobi_cycle(&self) {
+        let depth = self.jacobi_cycle_depth.get();
+        debug_assert!(depth > 0, "leave_jacobi_cycle called without matching enter");
+        self.jacobi_cycle_depth.set(depth - 1);
+    }
+
+    /// Returns whether all non-head cycle participants have converged
+    /// during the current iteration.
+    #[inline]
+    pub(crate) fn jacobi_all_converged(&self) -> bool {
+        self.jacobi_all_converged.get()
+    }
+
+    /// Sets the convergence flag for non-head cycle participants.
+    #[inline]
+    pub(crate) fn set_jacobi_all_converged(&self, converged: bool) {
+        self.jacobi_all_converged.set(converged);
     }
 
     #[inline]

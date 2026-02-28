@@ -167,7 +167,28 @@ where
         let _poison_guard =
             PoisonProvisionalIfPanicking::new(self, zalsa, id, memo_ingredient_index);
 
+        // JACOBI: Save the outer jacobi_all_converged so nested cycle heads
+        // don't clobber the outer cycle's convergence tracking.
+        let outer_jacobi_converged = claim_guard.zalsa_local().jacobi_all_converged();
+
         let (new_value, completed_query) = loop {
+            // JACOBI: Only activate Jacobi mode for Fixpoint cycles.
+            // FallbackImmediate already handles determinism via cycle_initial for all participants.
+            let _jacobi_guard = if C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint {
+                // Reset convergence flag for this iteration.
+                // Nested cycle heads will save/restore their own copy.
+                claim_guard.zalsa_local().set_jacobi_all_converged(true);
+                // Increment depth. Jacobi semantics are active only at depth 1
+                // (outermost cycle head). Inner cycle heads (depth 2+) use
+                // Gauss-Seidel to avoid oscillation in pass-through cycles.
+                claim_guard.zalsa_local().enter_jacobi_cycle();
+                Some(JacobiModeGuard {
+                    zalsa_local: claim_guard.zalsa_local(),
+                })
+            } else {
+                None
+            };
+
             let active_query = claim_guard
                 .zalsa_local()
                 .push_query(database_key_index, iteration_count);
@@ -186,6 +207,14 @@ where
                 active_query,
                 last_provisional_memo_opt.or(opt_old_memo),
             );
+
+            // JACOBI: Capture this iteration's convergence result before
+            // restoring the outer value.
+            let jacobi_participants_converged =
+                claim_guard.zalsa_local().jacobi_all_converged();
+
+            // JACOBI: Restore previous Jacobi mode (via drop of _jacobi_guard)
+            drop(_jacobi_guard);
 
             // Take the cycle heads to not-fight-rust's-borrow-checker.
             let mut cycle_heads = active_query.take_cycle_heads();
@@ -368,6 +397,10 @@ where
                 C::values_equal(&new_value, last_provisional_value)
             };
 
+            // JACOBI: The cycle has only converged if both the head value
+            // and all non-head participant values have converged.
+            let value_converged = value_converged && jacobi_participants_converged;
+
             let new_cycle_heads = active_query.take_cycle_heads();
             assert_no_new_cycle_heads(&cycle_heads, new_cycle_heads, database_key_index);
 
@@ -406,6 +439,13 @@ where
 
             continue;
         };
+
+        // JACOBI: Combine inner convergence with the outer cycle's convergence flag.
+        // If inner participants didn't converge, propagate that to the outer cycle.
+        // If the outer cycle had already detected non-convergence, preserve that too.
+        claim_guard.zalsa_local().set_jacobi_all_converged(
+            outer_jacobi_converged && claim_guard.zalsa_local().jacobi_all_converged(),
+        );
 
         tracing::debug!(
             "{database_key_index:?}: execute_maybe_iterate: result.revisions = {revisions:#?}",
@@ -668,7 +708,6 @@ fn complete_cycle_participant(
     claim_guard.set_release_mode(ReleaseMode::TransferTo(outer_cycle));
     let zalsa = claim_guard.zalsa();
 
-    let database_key_index = active_query.database_key_index;
     let mut completed_query = active_query.pop();
 
     flatten_cycle_dependencies(zalsa, &mut completed_query.revisions);
@@ -676,15 +715,11 @@ fn complete_cycle_participant(
     *completed_query.revisions.verified_final.get_mut() = false;
     completed_query.revisions.set_cycle_heads(cycle_heads);
 
-    let iteration_count = iteration_count.increment().unwrap_or_else(|| {
-        tracing::warn!("{database_key_index:?}: execute: too many cycle iterations");
-        panic!("{database_key_index:?}: execute: too many cycle iterations")
-    });
-
-    // The outermost query only bumps the iteration count of cycle heads. It doesn't
-    // increment the iteration count for cycle participants. It's important that we bump the
-    // iteration count here or the head will re-use the same iteration count in the next
-    // iteration (which can break cache invalidation).
+    // JACOBI: Do NOT increment the iteration count for cycle participants.
+    // By keeping the old iteration_count, `validate_same_iteration` will fail
+    // in the next iteration, forcing re-execution (Jacobi semantics).
+    // Previously we incremented to match the head's next count, which allowed
+    // Gauss-Seidel reuse of the newly computed value.
     completed_query
         .revisions
         .update_cycle_participant_iteration_count(iteration_count);
@@ -889,4 +924,16 @@ fn flatten_cycle_dependencies(zalsa: &Zalsa, head: &mut QueryRevisions) {
     seen.clear();
 
     FLATTEN_MAPS.set(Some((flattened, seen)));
+}
+
+/// RAII guard that increments the Jacobi cycle depth on creation and
+/// decrements it on drop (including during panics).
+struct JacobiModeGuard<'a> {
+    zalsa_local: &'a ZalsaLocal,
+}
+
+impl Drop for JacobiModeGuard<'_> {
+    fn drop(&mut self) {
+        self.zalsa_local.leave_jacobi_cycle();
+    }
 }

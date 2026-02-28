@@ -17,6 +17,51 @@ use crate::zalsa_local::{QueryOriginRef, QueryRevisions};
 use crate::{Event, EventKind, Id, Revision};
 
 impl<C: Configuration> IngredientImpl<C> {
+    /// Sets the Jacobi snapshot for the given key to the provided memo pointer.
+    /// The snapshot is a non-owning reference; the original memo must remain alive
+    /// (typically via `deleted_entries`).
+    pub(super) fn set_jacobi_snapshot(
+        &self,
+        zalsa: &Zalsa,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+        memo: &Memo<'_, C>,
+    ) {
+        let memo_ptr = NonNull::from(memo);
+        // SAFETY: transmute lifetime to 'static for type-erased storage
+        let static_ptr = unsafe {
+            transmute::<NonNull<Memo<'_, C>>, NonNull<Memo<'static, C>>>(memo_ptr)
+        };
+        // Record the current revision so we can detect stale snapshots
+        self.jacobi_snapshot_revision
+            .store(zalsa.current_revision());
+        zalsa
+            .memo_table_for::<C::SalsaStruct<'_>>(id)
+            .set_jacobi_snapshot(memo_ingredient_index, static_ptr);
+    }
+
+    /// Gets the Jacobi snapshot for the given key, if one has been set.
+    /// Returns `None` if the snapshot is from a different revision (stale).
+    pub(super) fn get_jacobi_snapshot<'db>(
+        &'db self,
+        zalsa: &'db Zalsa,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> Option<&'db Memo<'db, C>> {
+        // Guard: only return snapshots from the current revision.
+        // After `deleted_entries.clear()` in a new revision, old snapshot
+        // pointers would be dangling.
+        if self.jacobi_snapshot_revision.load() != zalsa.current_revision() {
+            return None;
+        }
+        let static_ptr: NonNull<Memo<'static, C>> = zalsa
+            .memo_table_for::<C::SalsaStruct<'_>>(id)
+            .get_jacobi_snapshot(memo_ingredient_index)?;
+        // SAFETY: The snapshot pointer is valid for 'db (kept alive by deleted_entries,
+        // which is only cleared on revision change, and we verified same revision above).
+        Some(unsafe { transmute::<&Memo<'static, C>, &'db Memo<'db, C>>(static_ptr.as_ref()) })
+    }
+
     /// Inserts the memo for the given key; (atomically) overwrites and returns any previously existing memo
     pub(super) fn insert_memo_into_table_for<'db>(
         &self,
