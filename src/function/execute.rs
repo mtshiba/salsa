@@ -1,7 +1,7 @@
 use smallvec::SmallVec;
 
 use crate::active_query::CompletedQuery;
-use crate::cycle::{CycleHeads, CycleRecoveryStrategy, IterationCount};
+use crate::cycle::{empty_cycle_heads, CycleHeads, CycleRecoveryStrategy, IterationCount};
 use crate::function::memo::Memo;
 use crate::function::sync::ReleaseMode;
 use crate::function::{ClaimGuard, Configuration, IngredientImpl};
@@ -205,6 +205,28 @@ where
                     completed_query
                         .revisions
                         .update_cycle_participant_iteration_count(iteration_count);
+
+                    // Durable widening: apply widening even when leaving the SCC
+                    // to prevent value shrinkage due to dynamic call graph changes.
+                    if C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint {
+                        if let Some(last_value) = last_provisional_memo_opt
+                            .or(opt_old_memo)
+                            .and_then(|m| m.value.as_ref())
+                        {
+                            let cycle = Cycle {
+                                head_ids: empty_cycle_heads().ids(),
+                                id,
+                                iteration: iteration_count.as_u32(),
+                            };
+                            new_value = C::recover_from_cycle(
+                                db,
+                                &cycle,
+                                last_value,
+                                new_value,
+                                C::id_to_input(zalsa, id),
+                            );
+                        }
+                    }
                 }
 
                 break (new_value, completed_query);
@@ -237,7 +259,33 @@ where
                 let new_value = if C::CYCLE_STRATEGY == CycleRecoveryStrategy::FallbackImmediate {
                     C::cycle_initial(db, id, C::id_to_input(zalsa, id))
                 } else {
-                    new_value
+                    // Apply widening to all cycle members, not just the cycle head.
+                    // This ensures determinism regardless of which query becomes the cycle head.
+                    let last_memo =
+                        self.get_memo_from_table_for(zalsa, id, memo_ingredient_index);
+                    if let Some(last_value) = last_memo
+                        .filter(|m| {
+                            m.may_be_provisional()
+                                && m.verified_at.load() == zalsa.current_revision()
+                        })
+                        .and_then(|m| m.value.as_ref())
+                    {
+                        let cycle = Cycle {
+                            head_ids: cycle_heads.ids(),
+                            id,
+                            iteration: iteration_count.as_u32(),
+                        };
+                        C::recover_from_cycle(
+                            db,
+                            &cycle,
+                            last_value,
+                            new_value,
+                            C::id_to_input(zalsa, id),
+                        )
+                    } else {
+                        // First iteration: no previous provisional value, use new_value as-is.
+                        new_value
+                    }
                 };
 
                 let completed_query = complete_cycle_participant(
