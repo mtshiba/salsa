@@ -302,7 +302,7 @@ where
                         let cycle = Cycle {
                             head_ids: cycle_heads.ids(),
                             id,
-                            iteration: iteration_count.as_u32(),
+                            iteration: max_iteration_count.as_u32(),
                         };
                         C::recover_from_cycle(
                             db,
