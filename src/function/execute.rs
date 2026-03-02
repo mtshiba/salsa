@@ -274,6 +274,7 @@ where
                                 id,
                                 iteration: iteration_count.as_u32(),
                             };
+                            cycle.trace_if_enabled(database_key_index);
                             new_value = C::recover_from_cycle(
                                 db,
                                 &cycle,
@@ -335,6 +336,7 @@ where
                             id,
                             iteration: max_iteration_count.as_u32(),
                         };
+                        cycle.trace_if_enabled(database_key_index);
                         C::recover_from_cycle(
                             db,
                             &cycle,
@@ -415,6 +417,7 @@ where
                     id,
                     iteration: iteration_count.as_u32(),
                 };
+                cycle.trace_if_enabled(database_key_index);
                 // JACOBI: Use snapshot value as widening's "previous" argument
                 // for deterministic iteration, but keep convergence check against
                 // last_provisional_value (table value) to avoid cross-thread snapshot pollution.

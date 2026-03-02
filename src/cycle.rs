@@ -486,6 +486,34 @@ impl Cycle {
     pub fn iteration(&self) -> u32 {
         self.iteration
     }
+
+    /// Emit a JSONL trace line if `SALSA_CYCLE_TRACE=1` is set.
+    ///
+    /// This is used for debugging non-deterministic cycle convergence.
+    /// Each line contains: query_key, iteration, head_count, head_hash, head_ids_sorted.
+    pub(crate) fn trace_if_enabled(&self, database_key_index: DatabaseKeyIndex) {
+        use std::hash::DefaultHasher;
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| std::env::var("SALSA_CYCLE_TRACE").as_deref() == Ok("1"));
+        if !enabled {
+            return;
+        }
+
+        let head_count = self.sorted_head_ids.len();
+        let mut hasher = DefaultHasher::new();
+        self.sorted_head_ids.hash(&mut hasher);
+        let head_hash = hasher.finish();
+
+        let thread_id = std::thread::current().id();
+        eprintln!(
+            r#"{{"query_key":"{database_key_index:?}","iteration":{},"head_count":{head_count},"head_hash":"{head_hash:016x}","head_ids_sorted":{:?},"thread":"{thread_id:?}"}}"#,
+            self.iteration,
+            self.sorted_head_ids.as_slice(),
+        );
+    }
 }
 
 #[derive(Debug)]
