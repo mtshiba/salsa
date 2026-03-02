@@ -94,14 +94,16 @@ impl ActiveQuery {
         self.durability = self.durability.min(durability);
         self.changed_at = self.changed_at.max(changed_at);
         self.untracked_read |= untracked_read;
-        self.disambiguator_map
-            .seed(active_tracked_ids.iter().map(|(id, _)| id));
 
         // Mark all tracked structs from the previous iteration as active.
+        // Do NOT seed disambiguator_map here: seeding calls disambiguate()
+        // which advances the counter, causing subsequent TypeParam::new calls
+        // to get a higher disambiguator than the seeded IdentityMap entries.
+        // This leads to identity mismatch and unnecessary reallocation of
+        // tracked struct IDs, which can cause oscillation in cycles where
+        // Jacobi snapshots change code paths (e.g., cycle_tracked_own_input).
         self.tracked_struct_ids
             .mark_all_active(active_tracked_ids.iter().copied());
-        self.disambiguator_map
-            .seed(active_tracked_ids.iter().map(|(id, _)| id));
     }
 
     pub(super) fn take_cycle_heads(&mut self) -> CycleHeads {

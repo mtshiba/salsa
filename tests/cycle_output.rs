@@ -133,7 +133,8 @@ fn revalidate_no_changes() {
     assert_eq!(query_b(&db, ab_input), 3);
 
     // Jacobi iteration requires extra iterations for participant convergence
-    db.assert_logs_len(22);
+    // and the minimum 2 Jacobi iterations before convergence
+    db.assert_logs_len(18);
 
     // trigger a new revision, but one that doesn't touch the query_a/query_b cycle
     c_input.set_value(&mut db).to(20);
@@ -149,8 +150,6 @@ fn revalidate_no_changes() {
             "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(401)) })",
             "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(402)) })",
             "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(403)) })",
-            "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(404)) })",
-            "salsa_event(DidValidateMemoizedValue { database_key: read_value(Id(405)) })",
             "salsa_event(DidValidateMemoizedValue { database_key: query_b(Id(0)) })",
         ]"#]]);
 }
@@ -166,7 +165,8 @@ fn revalidate_with_change_after_output_read() {
     assert_eq!(query_b(&db, ab_input), 3);
 
     // Jacobi iteration requires extra iterations for participant convergence
-    db.assert_logs_len(21);
+    // and the minimum 2 Jacobi iterations before convergence
+    db.assert_logs_len(17);
 
     // trigger a new revision that changes the output of query_d
     d_input.set_value(&mut db).to(20);
@@ -190,27 +190,17 @@ fn revalidate_with_change_after_output_read() {
             "salsa_event(WillDiscardStaleOutput { execute_key: query_a(Id(0)), output_key: Output(Id(403)) })",
             "salsa_event(DidDiscard { key: Output(Id(403)) })",
             "salsa_event(DidDiscard { key: read_value(Id(403)) })",
-            "salsa_event(WillDiscardStaleOutput { execute_key: query_a(Id(0)), output_key: Output(Id(404)) })",
-            "salsa_event(DidDiscard { key: Output(Id(404)) })",
-            "salsa_event(DidDiscard { key: read_value(Id(404)) })",
-            "salsa_event(WillDiscardStaleOutput { execute_key: query_a(Id(0)), output_key: Output(Id(405)) })",
-            "salsa_event(DidDiscard { key: Output(Id(405)) })",
-            "salsa_event(DidDiscard { key: read_value(Id(405)) })",
             "salsa_event(WillIterateCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(1) })",
             "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: read_value(Id(401g1)) })",
             "salsa_event(WillIterateCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(2) })",
             "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: read_value(Id(402g1)) })",
+            "salsa_event(WillExecute { database_key: read_value(Id(401g1)) })",
             "salsa_event(WillIterateCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(3) })",
             "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: read_value(Id(403g1)) })",
+            "salsa_event(WillExecute { database_key: read_value(Id(402g1)) })",
             "salsa_event(WillIterateCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(4) })",
             "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: read_value(Id(404g1)) })",
-            "salsa_event(WillIterateCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(5) })",
-            "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: read_value(Id(405g1)) })",
-            "salsa_event(DidFinalizeCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(5) })",
+            "salsa_event(WillExecute { database_key: read_value(Id(403g1)) })",
+            "salsa_event(DidFinalizeCycle { database_key: query_b(Id(0)), iteration_count: IterationCount(4) })",
         ]"#]]);
 }

@@ -71,10 +71,16 @@ fn infer_type_param<'db>(db: &'db dyn salsa::Database, node: TypeParamNode) -> T
         // and instead returns the one from the first iteration which
         // then is returned in the overall result (Class).
         match infer_class(db, constraint) {
-            Type::Class(class) => class
-                .type_params(db)
-                .unwrap_or_else(|| TypeParam::new(db, node.name(db), Some(Type::Unknown))),
-            Type::Unknown => TypeParam::new(db, node.name(db), Some(Type::Unknown)),
+            Type::Class(class) => {
+                let tp = class
+                    .type_params(db)
+                    .unwrap_or_else(|| TypeParam::new(db, node.name(db), Some(Type::Unknown)));
+                tp
+            }
+            Type::Unknown => {
+                let tp = TypeParam::new(db, node.name(db), Some(Type::Unknown));
+                tp
+            }
         }
     } else {
         TypeParam::new(db, node.name(db), None)
@@ -112,7 +118,11 @@ fn main() {
             "WillCheckCancellation",
             "WillExecute { database_key: infer_type_param(Id(400)) }",
             "WillCheckCancellation",
-            "DidFinalizeCycle { database_key: infer_class(Id(0)), iteration_count: IterationCount(1) }",
+            "WillIterateCycle { database_key: infer_class(Id(0)), iteration_count: IterationCount(2) }",
+            "WillCheckCancellation",
+            "WillExecute { database_key: infer_type_param(Id(400)) }",
+            "WillCheckCancellation",
+            "DidFinalizeCycle { database_key: infer_class(Id(0)), iteration_count: IterationCount(2) }",
         ]"#]]);
 
     let class = ty.class().unwrap();

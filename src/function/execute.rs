@@ -189,6 +189,25 @@ where
                 None
             };
 
+            // JACOBI: Set snapshot for HEAD before push_query (cycle_initial may call tracked queries).
+            // - iteration 0-1: use cycle_initial as snapshot (deterministic starting point)
+            // - iteration 2+: use table value as snapshot
+            if last_provisional_memo_opt.is_some()
+                && C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint
+            {
+                if iteration_count.as_u32() <= 1 {
+                    self.set_jacobi_initial_snapshot(db, zalsa, id, memo_ingredient_index);
+                } else if let Some(old_memo) =
+                    self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)
+                {
+                    if old_memo.may_be_provisional()
+                        && old_memo.verified_at.load() == zalsa.current_revision()
+                    {
+                        self.set_jacobi_snapshot(zalsa, id, memo_ingredient_index, old_memo);
+                    }
+                }
+            }
+
             let active_query = claim_guard
                 .zalsa_local()
                 .push_query(database_key_index, iteration_count);
@@ -213,8 +232,11 @@ where
             let jacobi_participants_converged =
                 claim_guard.zalsa_local().jacobi_all_converged();
 
-            // JACOBI: Restore previous Jacobi mode (via drop of _jacobi_guard)
-            drop(_jacobi_guard);
+            // JACOBI: The guard is NOT dropped here. Jacobi mode remains
+            // active through cycle_fn (recover_from_cycle) calls so that
+            // if cycle_fn calls back into cycle participants, they return
+            // snapshot values (deterministic). The guard drops naturally
+            // at the end of each loop iteration (break or continue).
 
             // Take the cycle heads to not-fight-rust's-borrow-checker.
             let mut cycle_heads = active_query.take_cycle_heads();
@@ -237,11 +259,16 @@ where
 
                     // Durable widening: apply widening even when leaving the SCC
                     // to prevent value shrinkage due to dynamic call graph changes.
+                    // JACOBI: Prefer snapshot value as widening's "previous" argument.
                     if C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint {
-                        if let Some(last_value) = last_provisional_memo_opt
-                            .or(opt_old_memo)
-                            .and_then(|m| m.value.as_ref())
-                        {
+                        let snapshot_value = self
+                            .get_jacobi_snapshot(zalsa, id, memo_ingredient_index)
+                            .and_then(|s| s.value.as_ref());
+                        if let Some(last_value) = snapshot_value.or_else(|| {
+                            last_provisional_memo_opt
+                                .or(opt_old_memo)
+                                .and_then(|m| m.value.as_ref())
+                        }) {
                             let cycle = Cycle {
                                 head_ids: empty_cycle_heads().ids(),
                                 id,
@@ -290,15 +317,19 @@ where
                 } else {
                     // Apply widening to all cycle members, not just the cycle head.
                     // This ensures determinism regardless of which query becomes the cycle head.
-                    let last_memo =
-                        self.get_memo_from_table_for(zalsa, id, memo_ingredient_index);
-                    if let Some(last_value) = last_memo
-                        .filter(|m| {
-                            m.may_be_provisional()
-                                && m.verified_at.load() == zalsa.current_revision()
-                        })
-                        .and_then(|m| m.value.as_ref())
-                    {
+                    // JACOBI: Prefer snapshot value as widening's "previous" argument.
+                    let jacobi_previous = self
+                        .get_jacobi_snapshot(zalsa, id, memo_ingredient_index)
+                        .and_then(|s| s.value.as_ref());
+                    let last_value = jacobi_previous.or_else(|| {
+                        self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)
+                            .filter(|m| {
+                                m.may_be_provisional()
+                                    && m.verified_at.load() == zalsa.current_revision()
+                            })
+                            .and_then(|m| m.value.as_ref())
+                    });
+                    if let Some(last_value) = last_value {
                         let cycle = Cycle {
                             head_ids: cycle_heads.ids(),
                             id,
@@ -384,22 +415,37 @@ where
                     id,
                     iteration: iteration_count.as_u32(),
                 };
-                // We are in a cycle that hasn't converged; ask the user's
-                // cycle-recovery function what to do (it may return the same value or a different one):
+                // JACOBI: Use snapshot value as widening's "previous" argument
+                // for deterministic iteration, but keep convergence check against
+                // last_provisional_value (table value) to avoid cross-thread snapshot pollution.
+                let jacobi_previous = self
+                    .get_jacobi_snapshot(zalsa, id, memo_ingredient_index)
+                    .and_then(|s| s.value.as_ref());
+                let widening_previous = jacobi_previous.unwrap_or(last_provisional_value);
                 new_value = C::recover_from_cycle(
                     db,
                     &cycle,
-                    last_provisional_value,
+                    widening_previous,
                     new_value,
                     C::id_to_input(zalsa, id),
                 );
 
+                // Convergence check uses last_provisional_value (NOT snapshot)
+                // to avoid cross-thread snapshot contamination in parallel mode.
                 C::values_equal(&new_value, last_provisional_value)
             };
 
             // JACOBI: The cycle has only converged if both the head value
             // and all non-head participant values have converged.
-            let value_converged = value_converged && jacobi_participants_converged;
+            // Additionally, never converge at iteration <= 1 because:
+            // - Iteration 0: GS discovery, table value is non-deterministic
+            // - Iteration 1: First Jacobi iteration, comparing against GS table value
+            //   may yield false convergence when GS happens to match Jacobi output.
+            // At iteration 2+, both the table value and new value are Jacobi-computed
+            // (deterministic), so convergence is meaningful.
+            let value_converged = value_converged
+                && jacobi_participants_converged
+                && iteration_count.as_u32() >= 2;
 
             let new_cycle_heads = active_query.take_cycle_heads();
             assert_no_new_cycle_heads(&cycle_heads, new_cycle_heads, database_key_index);

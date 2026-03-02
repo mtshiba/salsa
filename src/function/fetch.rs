@@ -34,7 +34,13 @@ where
         // which would cause assertion failures when merged with current-iteration cycle_heads.
         // However, if the memo has been finalized (e.g., an inner cycle converged), use the
         // finalized value—not the stale snapshot from before the inner cycle ran.
-        let memo_value = if zalsa_local.is_jacobi_mode() && memo.may_be_provisional() {
+        let memo_value = if zalsa_local.is_jacobi_mode()
+            && memo.may_be_provisional()
+            && memo.cycle_heads().contains(&database_key_index)
+        {
+            // Only use Jacobi snapshot for cycle heads (self-referential queries).
+            // Non-head participants should return their freshly computed value,
+            // not the stale snapshot from the previous iteration.
             let memo_ingredient_index = self.memo_ingredient_index(zalsa, id);
             if let Some(snapshot) =
                 self.get_jacobi_snapshot(zalsa, id, memo_ingredient_index)
@@ -172,10 +178,28 @@ where
                     && old_memo.may_be_provisional()
                     && old_memo.verified_at.load() == zalsa.current_revision()
                 {
-                    tracing::debug!(
-                        "{database_key_index:?}: saving Jacobi snapshot before re-execution"
-                    );
-                    self.set_jacobi_snapshot(zalsa, id, memo_ingredient_index, old_memo);
+                    if self.get_jacobi_snapshot(zalsa, id, memo_ingredient_index).is_none() {
+                        if C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint {
+                            // Fixpoint queries: use cycle_initial as snapshot for
+                            // deterministic iteration 1.
+                            tracing::debug!(
+                                "{database_key_index:?}: saving initial Jacobi snapshot (cycle_initial)"
+                            );
+                            self.set_jacobi_initial_snapshot(db, zalsa, id, memo_ingredient_index);
+                        } else {
+                            // Non-Fixpoint queries (Panic, FallbackImmediate) that participate
+                            // in a cycle: save old memo as snapshot for convergence tracking.
+                            tracing::debug!(
+                                "{database_key_index:?}: saving Jacobi snapshot (old memo)"
+                            );
+                            self.set_jacobi_snapshot(zalsa, id, memo_ingredient_index, old_memo);
+                        }
+                    } else {
+                        tracing::debug!(
+                            "{database_key_index:?}: saving Jacobi snapshot before re-execution"
+                        );
+                        self.set_jacobi_snapshot(zalsa, id, memo_ingredient_index, old_memo);
+                    }
                 }
 
                 let verify_result = self.deep_verify_memo(db, zalsa, old_memo, database_key_index);
@@ -190,8 +214,12 @@ where
 
         let result = self.execute(db, claim_guard, opt_old_memo);
 
-        // JACOBI: After re-execution, check if the non-head participant converged
-        if zalsa_local.is_jacobi_mode() {
+        // JACOBI: After re-execution, check if the non-head participant converged.
+        // Only check Fixpoint-strategy queries: non-Fixpoint queries (e.g. Panic)
+        // may create tracked structs whose Ids oscillate across iterations,
+        // causing spurious non-convergence. Fixpoint queries define explicit
+        // convergence semantics via cycle_initial/cycle_fn.
+        if zalsa_local.is_jacobi_mode() && C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint {
             if let Some(snapshot) = self.get_jacobi_snapshot(zalsa, id, memo_ingredient_index) {
                 if let Some(new_memo) =
                     self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)

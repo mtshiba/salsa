@@ -53,7 +53,7 @@ fn the_test() {
     let input = Input::new(&db, 1);
     assert_eq!(entry(&db, input), 5);
 
-    db.assert_logs_len(16);
+    db.assert_logs_len(18);
 
     input.set_value(&mut db).to(2);
 
@@ -75,7 +75,9 @@ fn the_test() {
             "WillCheckCancellation",
             "WillIterateCycle { database_key: query(Id(0)), iteration_count: IterationCount(5) }",
             "WillCheckCancellation",
-            "DidFinalizeCycle { database_key: query(Id(0)), iteration_count: IterationCount(5) }",
+            "WillIterateCycle { database_key: query(Id(0)), iteration_count: IterationCount(6) }",
+            "WillCheckCancellation",
+            "DidFinalizeCycle { database_key: query(Id(0)), iteration_count: IterationCount(6) }",
             "DidValidateMemoizedValue { database_key: entry(Id(0)) }",
         ]"#]]);
 }

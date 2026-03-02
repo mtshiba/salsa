@@ -82,7 +82,9 @@ fn the_test() {
             "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(1) })",
             "salsa_event(WillExecute { database_key: query_b(Id(400)) })",
             "salsa_event(WillExecute { database_key: query_c(Id(800)) })",
-            "salsa_event(DidFinalizeCycle { database_key: query_b(Id(400)), iteration_count: IterationCount(1) })",
+            "salsa_event(WillIterateCycle { database_key: query_b(Id(400)), iteration_count: IterationCount(2) })",
+            "salsa_event(WillExecute { database_key: query_c(Id(800)) })",
+            "salsa_event(DidFinalizeCycle { database_key: query_b(Id(400)), iteration_count: IterationCount(2) })",
             "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
             "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(2) })",
             "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
@@ -90,10 +92,6 @@ fn the_test() {
             "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
             "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(4) })",
             "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
-            "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(5) })",
-            "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
-            "salsa_event(WillIterateCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(6) })",
-            "salsa_event(WillExecute { database_key: query_d(Id(c00)) })",
-            "salsa_event(DidFinalizeCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(6) })",
+            "salsa_event(DidFinalizeCycle { database_key: query_a(Id(0)), iteration_count: IterationCount(4) })",
         ]"#]]);
 }

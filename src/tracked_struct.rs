@@ -460,15 +460,6 @@ impl DisambiguatorMap {
         result
     }
 
-    pub(crate) fn seed<'a>(&mut self, identities: impl Iterator<Item = &'a Identity>) {
-        for identity in identities {
-            self.disambiguate(IdentityHash {
-                ingredient_index: identity.ingredient_index,
-                hash: identity.hash,
-            });
-        }
-    }
-
     pub(crate) fn clear(&mut self) {
         self.map.clear()
     }
@@ -521,6 +512,30 @@ where
             // The struct already exists in the intern map.
             let index = self.database_key_index(id);
             crate::tracing::trace!("Reuse tracked struct {id:?}", id = index);
+
+            // During fixpoint iteration, the struct may have been created in a
+            // previous iteration of this same query (same revision). The update()
+            // function returns early when updated_at == current_revision, assuming
+            // fields are immutable within a revision. But during fixpoint iteration,
+            // tracked fields may change across iterations (e.g., different offset values).
+            // Reset updated_at to allow the update to proceed.
+            //
+            // This reset must ONLY happen during fixpoint iteration (Jacobi mode).
+            // During normal re-execution, updated_at == current_revision means the
+            // struct was validated/verified earlier in this revision, and updating it
+            // would overwrite validated data with potentially non-deterministic values
+            // (see preverify-struct-with-leaked-data test).
+            if zalsa_local.is_jacobi_mode() {
+                let data_raw = Self::data_raw(zalsa.table(), id);
+                // SAFETY: updated_at is never exclusively borrowed, and we are the sole
+                // writer of this tracked struct (enforced by IdentityMap ownership).
+                unsafe {
+                    if (*data_raw).updated_at.load() == Some(zalsa.current_revision()) {
+                        // Use a sentinel revision guaranteed to differ from current_revision.
+                        (*data_raw).updated_at.swap(Some(Revision::from(usize::MAX)));
+                    }
+                }
+            }
 
             // SAFETY: The `id` was present in the interned map, so the value must be initialized.
             let update_result = unsafe { self.update(zalsa, id, &current_deps, fields) };

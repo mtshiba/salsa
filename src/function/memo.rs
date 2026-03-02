@@ -40,6 +40,37 @@ impl<C: Configuration> IngredientImpl<C> {
             .set_jacobi_snapshot(memo_ingredient_index, static_ptr);
     }
 
+    /// Creates a new memo containing the `cycle_initial` value and sets it as
+    /// the Jacobi snapshot. The memo is stored in `deleted_entries` to keep the
+    /// pointer stable across the revision.
+    pub(super) fn set_jacobi_initial_snapshot<'db>(
+        &'db self,
+        db: &'db C::DbView,
+        zalsa: &'db Zalsa,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) {
+        let initial_value = C::cycle_initial(db, id, C::id_to_input(zalsa, id));
+        let database_key_index = self.database_key_index(id);
+        let revisions = QueryRevisions::fixpoint_initial(
+            database_key_index,
+            IterationCount::initial(),
+        );
+        let memo = Memo::new(Some(initial_value), zalsa.current_revision(), revisions);
+        let ptr = NonNull::from(Box::leak(Box::new(memo)));
+        // SAFETY: ptr is valid and will be freed when deleted_entries is cleared.
+        unsafe { self.deleted_entries.push(ptr); }
+        self.jacobi_snapshot_revision
+            .store(zalsa.current_revision());
+        // SAFETY: transmute lifetime to 'static for type-erased storage
+        let static_ptr = unsafe {
+            transmute::<NonNull<Memo<'_, C>>, NonNull<Memo<'static, C>>>(ptr)
+        };
+        zalsa
+            .memo_table_for::<C::SalsaStruct<'_>>(id)
+            .set_jacobi_snapshot(memo_ingredient_index, static_ptr);
+    }
+
     /// Gets the Jacobi snapshot for the given key, if one has been set.
     /// Returns `None` if the snapshot is from a different revision (stale).
     pub(super) fn get_jacobi_snapshot<'db>(

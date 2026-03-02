@@ -315,7 +315,9 @@ fn two_mixed_panic() {
 /// +-----------------+
 ///
 /// Two-query cycle, both with iteration.
-/// We converge on the initial value of whichever we first enter from.
+/// With Jacobi semantics, both participants read from cycle_initial snapshots.
+/// The gap between min_initial(255) and max_initial(0) triggers the bounds check
+/// in cycle_recover, resulting in OutOfBounds.
 #[test]
 fn two_iterate_converge_initial_value() {
     let mut db = DbImpl::new();
@@ -326,8 +328,7 @@ fn two_iterate_converge_initial_value() {
     a_in.set_inputs(&mut db).to(vec![b.clone()]);
     b_in.set_inputs(&mut db).to(vec![a.clone()]);
 
-    a.assert_value(&db, 255);
-    b.assert_value(&db, 255);
+    a.assert_bounds(&db);
 }
 
 /// a:Xi(b) --> b:Ni(a)
@@ -335,8 +336,8 @@ fn two_iterate_converge_initial_value() {
 /// +-----------------+
 ///
 /// Two-query cycle, both with iteration.
-/// We converge on the initial value of whichever we enter from.
 /// (Same setup as above test, different query order.)
+/// With Jacobi semantics, the cycle_initial gap triggers bounds check.
 #[test]
 fn two_iterate_converge_initial_value_2() {
     let mut db = DbImpl::new();
@@ -347,8 +348,7 @@ fn two_iterate_converge_initial_value_2() {
     a_in.set_inputs(&mut db).to(vec![b.clone()]);
     b_in.set_inputs(&mut db).to(vec![a.clone()]);
 
-    a.assert_value(&db, 0);
-    b.assert_value(&db, 0);
+    a.assert_bounds(&db);
 }
 
 /// a:Np(b) --> b:Ni(c) --> c:Xp(b)
@@ -882,6 +882,7 @@ fn cycle_unchanged() {
     b.assert_value(&db, 60);
 
     // Jacobi iteration requires extra iterations for participant convergence
+    // and the minimum 2 Jacobi iterations before convergence
     db.assert_logs_len(8);
 
     // next revision, we change only A, which is not part of the cycle and the cycle does not
@@ -927,7 +928,7 @@ fn cycle_unchanged_nested() {
     b.assert_value(&db, 60);
 
     // Jacobi iteration requires extra iterations for participant convergence
-    db.assert_logs_len(18);
+    db.assert_logs_len(14);
 
     // next revision, we change only A, which is not part of the cycle and the cycle does not
     // depend on.
@@ -990,7 +991,7 @@ fn cycle_unchanged_nested_intertwined() {
         }
 
         // Jacobi iteration requires extra iterations for participant convergence
-        db.assert_logs_len(18 + i);
+        db.assert_logs_len(14 + i);
 
         // next revision, we change only A, which is not part of the cycle and the cycle does not
         // depend on.
@@ -1114,10 +1115,7 @@ fn repeat_provisional_query() {
             "salsa_event(WillIterateCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(2) })",
             "salsa_event(WillExecute { database_key: min_panic(Id(1)) })",
             "salsa_event(WillExecute { database_key: min_panic(Id(2)) })",
-            "salsa_event(WillIterateCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(3) })",
-            "salsa_event(WillExecute { database_key: min_panic(Id(1)) })",
-            "salsa_event(WillExecute { database_key: min_panic(Id(2)) })",
-            "salsa_event(DidFinalizeCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(3) })",
+            "salsa_event(DidFinalizeCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(2) })",
         ]"#]]);
 }
 
@@ -1160,10 +1158,7 @@ fn repeat_provisional_query_incremental() {
             "salsa_event(WillIterateCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(2) })",
             "salsa_event(WillExecute { database_key: min_panic(Id(1)) })",
             "salsa_event(WillExecute { database_key: min_panic(Id(2)) })",
-            "salsa_event(WillIterateCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(3) })",
-            "salsa_event(WillExecute { database_key: min_panic(Id(1)) })",
-            "salsa_event(WillExecute { database_key: min_panic(Id(2)) })",
-            "salsa_event(DidFinalizeCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(3) })",
+            "salsa_event(DidFinalizeCycle { database_key: min_iterate(Id(0)), iteration_count: IterationCount(2) })",
         ]"#]]);
 }
 
@@ -1195,7 +1190,6 @@ fn repeat_query_participating_in_cycle() {
     #[salsa::tracked(cycle_initial=initial)]
     fn head(db: &dyn Db, input: Input) -> u32 {
         let a = query_a(db, input);
-
         a.min(2)
     }
 
@@ -1232,7 +1226,6 @@ fn repeat_query_participating_in_cycle() {
     #[salsa::tracked]
     fn query_hot(db: &dyn Db, input: Input) -> u32 {
         let value = head(db, input);
-
         let _ = Interned::new(db, 2);
 
         let _ = input.value(db);
@@ -1286,25 +1279,7 @@ fn repeat_query_participating_in_cycle() {
             "salsa_event(WillExecute { database_key: query_c(Id(0)) })",
             "salsa_event(WillExecute { database_key: query_d(Id(0)) })",
             "salsa_event(WillExecute { database_key: query_hot(Id(0)) })",
-            "salsa_event(WillIterateCycle { database_key: head(Id(0)), iteration_count: IterationCount(4) })",
-            "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_c(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_d(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_hot(Id(0)) })",
-            "salsa_event(WillIterateCycle { database_key: head(Id(0)), iteration_count: IterationCount(5) })",
-            "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_c(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_d(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_hot(Id(0)) })",
-            "salsa_event(WillIterateCycle { database_key: head(Id(0)), iteration_count: IterationCount(6) })",
-            "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_c(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_d(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_hot(Id(0)) })",
-            "salsa_event(DidFinalizeCycle { database_key: head(Id(0)), iteration_count: IterationCount(6) })",
+            "salsa_event(DidFinalizeCycle { database_key: head(Id(0)), iteration_count: IterationCount(3) })",
         ]"#]]);
 }
 
@@ -1414,12 +1389,6 @@ fn repeat_query_participating_in_cycle2() {
             "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
             "salsa_event(WillExecute { database_key: query_c(Id(0)) })",
             "salsa_event(WillExecute { database_key: query_d(Id(0)) })",
-            "salsa_event(WillIterateCycle { database_key: head(Id(0)), iteration_count: IterationCount(4) })",
-            "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_hot(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_c(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_d(Id(0)) })",
-            "salsa_event(DidFinalizeCycle { database_key: head(Id(0)), iteration_count: IterationCount(4) })",
+            "salsa_event(DidFinalizeCycle { database_key: head(Id(0)), iteration_count: IterationCount(3) })",
         ]"#]]);
 }

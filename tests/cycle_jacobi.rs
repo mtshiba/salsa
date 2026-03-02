@@ -107,9 +107,6 @@ fn jacobi_snapshot_causes_propagation_delay() {
             "salsa_event(WillIterateCycle { database_key: head(Id(0)), iteration_count: IterationCount(2) })",
             "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
             "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
-            "salsa_event(WillIterateCycle { database_key: head(Id(0)), iteration_count: IterationCount(3) })",
-            "salsa_event(WillExecute { database_key: query_a(Id(0)) })",
-            "salsa_event(WillExecute { database_key: query_b(Id(0)) })",
-            "salsa_event(DidFinalizeCycle { database_key: head(Id(0)), iteration_count: IterationCount(3) })",
+            "salsa_event(DidFinalizeCycle { database_key: head(Id(0)), iteration_count: IterationCount(2) })",
         ]"#]]);
 }
