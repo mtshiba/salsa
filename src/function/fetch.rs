@@ -28,19 +28,27 @@ where
 
         let memo = self.refresh_memo(db, zalsa, zalsa_local, id);
 
-        // JACOBI: In Jacobi mode, use the snapshot VALUE (previous iteration) if available,
-        // but always report metadata (cycle_heads, durability, changed_at) from the LATEST memo.
-        // This is critical: snapshot memos have stale cycle_heads with old iteration counts,
-        // which would cause assertion failures when merged with current-iteration cycle_heads.
-        // However, if the memo has been finalized (e.g., an inner cycle converged), use the
-        // finalized value—not the stale snapshot from before the inner cycle ran.
+        // FIXPOINT JACOBI: Return the previous-iteration snapshot for Fixpoint-strategy
+        // provisional queries. This ensures every Fixpoint query in a cycle sees the same
+        // snapshot values regardless of execution order, making fixpoint iteration fully
+        // deterministic.
+        //
+        // Non-Fixpoint (Panic) queries return their fresh table values. Their values are
+        // computed from Fixpoint snapshots (deterministic inputs), so they are also
+        // deterministic. Returning fresh values instead of snapshots avoids premature
+        // convergence in mixed Fixpoint/Panic cycles.
+        //
+        // Snapshots are: cycle_initial at iteration 1 (set in fetch_cold/execute.rs),
+        // previous iteration's table value at iteration 2+ (set in fetch_cold).
+        // If no snapshot exists (iteration 0, SCC discovery), fall through to table value.
+        //
+        // Always report METADATA (cycle_heads, durability, changed_at) from the LATEST memo,
+        // not the snapshot. Snapshot memos have stale cycle_heads with old iteration counts.
+        // Finalized memos (may_be_provisional=false) skip this path entirely.
         let memo_value = if zalsa_local.is_jacobi_mode()
             && memo.may_be_provisional()
-            && memo.cycle_heads().contains(&database_key_index)
+            && C::CYCLE_STRATEGY == CycleRecoveryStrategy::Fixpoint
         {
-            // Only use Jacobi snapshot for cycle heads (self-referential queries).
-            // Non-head participants should return their freshly computed value,
-            // not the stale snapshot from the previous iteration.
             let memo_ingredient_index = self.memo_ingredient_index(zalsa, id);
             if let Some(snapshot) =
                 self.get_jacobi_snapshot(zalsa, id, memo_ingredient_index)

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(grep:*)",
+      "Bash(UPDATE_EXPECT=1 cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(RUST_LOG=salsa::function::execute=debug cargo test:*)",
+      "Bash(RUST_LOG=salsa::function::execute=info cargo test:*)",
+      "Bash(RUST_LOG=salsa=debug cargo test:*)",
+      "Bash(ls:*)",
+      "Bash(RUST_LOG=salsa=info cargo test:*)",
+      "Bash(RUST_LOG=salsa::function=debug cargo test --features inventory --test cycle_tracked_own_input)",
+      "Bash(RUST_LOG=salsa::function::execute=debug,salsa::function::fetch=debug cargo test:*)",
+      "Bash(RUST_MIN_STACK=8388608 cargo test -p ty_python_semantic --test mdtest -- --test-threads=4)"
+    ]
+  }
+}
