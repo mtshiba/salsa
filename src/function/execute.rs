@@ -270,7 +270,7 @@ where
                                 .and_then(|m| m.value.as_ref())
                         }) {
                             let cycle = Cycle {
-                                head_ids: empty_cycle_heads().ids(),
+                                sorted_head_ids: empty_cycle_heads().sorted_ids(),
                                 id,
                                 iteration: iteration_count.as_u32(),
                             };
@@ -331,7 +331,7 @@ where
                     });
                     if let Some(last_value) = last_value {
                         let cycle = Cycle {
-                            head_ids: cycle_heads.ids(),
+                            sorted_head_ids: cycle_heads.sorted_ids(),
                             id,
                             iteration: max_iteration_count.as_u32(),
                         };
@@ -411,7 +411,7 @@ where
                 true
             } else {
                 let cycle = Cycle {
-                    head_ids: cycle_heads.ids(),
+                    sorted_head_ids: cycle_heads.sorted_ids(),
                     id,
                     iteration: iteration_count.as_u32(),
                 };

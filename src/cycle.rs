@@ -238,8 +238,14 @@ impl CycleHeads {
         }
     }
 
-    pub(crate) fn ids(&self) -> CycleHeadIdsIterator<'_> {
-        CycleHeadIdsIterator { inner: self.iter() }
+    /// Returns a sorted list of cycle head IDs.
+    ///
+    /// Sorting by `DatabaseKeyIndex` ensures deterministic ordering
+    /// regardless of the order in which cycle heads were discovered.
+    pub(crate) fn sorted_ids(&self) -> ThinVec<Id> {
+        let mut ids: ThinVec<Id> = self.iter().map(|h| h.database_key_index.key_index()).collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Iterates over all cycle heads that aren't equal to `own`.
@@ -453,34 +459,22 @@ pub(crate) fn empty_cycle_heads() -> &'static CycleHeads {
     EMPTY_CYCLE_HEADS.get_or_init(|| CycleHeads(ThinVec::new()))
 }
 
-#[derive(Clone)]
-pub struct CycleHeadIdsIterator<'a> {
-    inner: CycleHeadsIterator<'a>,
-}
-
-impl Iterator for CycleHeadIdsIterator<'_> {
-    type Item = crate::Id;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|head| head.database_key_index.key_index())
-    }
-}
-
 /// The context that the cycle recovery function receives when a query cycle occurs.
-pub struct Cycle<'a> {
-    pub(crate) head_ids: CycleHeadIdsIterator<'a>,
+pub struct Cycle {
+    /// Sorted cycle head IDs for deterministic iteration regardless of discovery order.
+    pub(crate) sorted_head_ids: ThinVec<Id>,
     pub(crate) id: Id,
     pub(crate) iteration: u32,
 }
 
-impl Cycle<'_> {
-    /// An iterator that outputs the [`Id`]s of the current cycle heads.
+impl Cycle {
+    /// An iterator that outputs the [`Id`]s of the current cycle heads,
+    /// sorted by [`Id`] for deterministic ordering regardless of discovery order.
+    ///
     /// This always contains the [`Id`] of the current query but it can contain additional cycle head [`Id`]s
     /// if this query is nested in an outer cycle or if it has nested cycles.
-    pub fn head_ids(&self) -> CycleHeadIdsIterator<'_> {
-        self.head_ids.clone()
+    pub fn head_ids(&self) -> impl ExactSizeIterator<Item = Id> + Clone + '_ {
+        self.sorted_head_ids.iter().copied()
     }
 
     /// The [`Id`] of the query that the current cycle recovery function is processing.
