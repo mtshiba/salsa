@@ -172,16 +172,9 @@ where
     ) -> &'db Memo<'db, C> {
         // no provisional value; create/insert/return initial provisional value
         match C::CYCLE_STRATEGY {
-            // SAFETY: We do not access the query stack reentrantly.
-            CycleRecoveryStrategy::Panic => unsafe {
-                zalsa_local.with_query_stack_unchecked(|stack| {
-                    panic!(
-                        "dependency graph cycle when querying {database_key_index:#?}, \
-                    set cycle_fn/cycle_initial to fixpoint iterate.\n\
-                    Query stack:\n{stack:#?}",
-                    );
-                })
-            },
+            CycleRecoveryStrategy::Panic => {
+                fetch_cold_cycle_panic(zalsa_local, database_key_index)
+            }
             CycleRecoveryStrategy::Fixpoint | CycleRecoveryStrategy::FallbackImmediate => {
                 // check if there's a provisional value for this query
                 // Note we don't `validate_may_be_provisional` the memo here as we want to reuse an
@@ -237,5 +230,26 @@ where
                 )
             }
         }
+    }
+}
+
+/// Non-generic panic handler for cycle detection in `fetch_cold_cycle`.
+///
+/// Extracted to avoid monomorphizing this cold path for every `Configuration` type.
+#[cold]
+#[inline(never)]
+fn fetch_cold_cycle_panic(
+    zalsa_local: &ZalsaLocal,
+    database_key_index: DatabaseKeyIndex,
+) -> ! {
+    // SAFETY: We do not access the query stack reentrantly.
+    unsafe {
+        zalsa_local.with_query_stack_unchecked(|stack| {
+            panic!(
+                "dependency graph cycle when querying {database_key_index:#?}, \
+                set cycle_fn/cycle_initial to fixpoint iterate.\n\
+                Query stack:\n{stack:#?}",
+            );
+        })
     }
 }

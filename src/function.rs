@@ -343,30 +343,13 @@ where
             return;
         };
 
-        let origin = memo.revisions.origin.as_ref();
-
-        visited_edges.insert(edge);
-
-        // Collect the minimum dependency tree.
-        for edge in origin.edges() {
-            // Avoid forming cycles.
-            if visited_edges.contains(edge) {
-                continue;
-            }
-
-            // Avoid flattening edges that we're going to serialize directly.
-            if serialized_edges.contains(edge) {
-                continue;
-            }
-
-            let dependency = zalsa.lookup_ingredient(edge.key().ingredient_index());
-            dependency.collect_minimum_serialized_edges(
-                zalsa,
-                *edge,
-                serialized_edges,
-                visited_edges,
-            )
-        }
+        collect_minimum_serialized_edges_inner(
+            zalsa,
+            edge,
+            memo.revisions.origin.as_ref(),
+            serialized_edges,
+            visited_edges,
+        );
     }
 
     /// Returns `final` if the memo has the `verified_final` flag set.
@@ -433,39 +416,15 @@ where
 
         let database_key_index = self.database_key_index(id);
 
-        // Only flatten dependencies of provisional queries, because only those
-        // contain cyclic dependencies.
-        if !memo.may_be_provisional() {
-            flattened_input_outputs.insert(QueryEdge::input(database_key_index));
-            return;
-        }
-
-        // There's nothing to do if we've visited this query before.
-        if !seen.insert(database_key_index) {
-            return;
-        }
-
-        let inputs = memo.revisions.origin.as_ref().inputs();
-
-        match C::CYCLE_STRATEGY {
-            // For queries with cycle handling, simply extend the input/outputs, because
-            // they already flattened their own dependencies when completing the query.
-            CycleRecoveryStrategy::FallbackImmediate | CycleRecoveryStrategy::Fixpoint => {
-                flattened_input_outputs.extend(inputs.map(QueryEdge::input));
-            }
-            // For regular queries, recurse
-            CycleRecoveryStrategy::Panic => {
-                for input in inputs {
-                    let ingredient = zalsa.lookup_ingredient(input.ingredient_index());
-                    ingredient.flatten_cycle_head_dependencies(
-                        zalsa,
-                        input.key_index(),
-                        flattened_input_outputs,
-                        seen,
-                    );
-                }
-            }
-        }
+        flatten_cycle_head_dependencies_inner(
+            zalsa,
+            database_key_index,
+            memo.may_be_provisional(),
+            memo.revisions.origin.as_ref(),
+            C::CYCLE_STRATEGY,
+            flattened_input_outputs,
+            seen,
+        );
     }
 
     fn cycle_converged(&self, zalsa: &Zalsa, input: Id) -> bool {
@@ -629,6 +588,87 @@ where
         f.debug_struct(std::any::type_name::<Self>())
             .field("index", &self.index)
             .finish()
+    }
+}
+
+/// Non-generic helper for [`Ingredient::collect_minimum_serialized_edges`].
+///
+/// Extracted to avoid monomorphizing this logic for every `Configuration` type.
+fn collect_minimum_serialized_edges_inner(
+    zalsa: &Zalsa,
+    edge: QueryEdge,
+    origin: QueryOriginRef<'_>,
+    serialized_edges: &mut FxIndexSet<QueryEdge>,
+    visited_edges: &mut FxHashSet<QueryEdge>,
+) {
+    visited_edges.insert(edge);
+
+    // Collect the minimum dependency tree.
+    for edge in origin.edges() {
+        // Avoid forming cycles.
+        if visited_edges.contains(edge) {
+            continue;
+        }
+
+        // Avoid flattening edges that we're going to serialize directly.
+        if serialized_edges.contains(edge) {
+            continue;
+        }
+
+        let dependency = zalsa.lookup_ingredient(edge.key().ingredient_index());
+        dependency.collect_minimum_serialized_edges(
+            zalsa,
+            *edge,
+            serialized_edges,
+            visited_edges,
+        )
+    }
+}
+
+/// Non-generic helper for [`Ingredient::flatten_cycle_head_dependencies`].
+///
+/// Extracted to avoid monomorphizing this logic for every `Configuration` type.
+fn flatten_cycle_head_dependencies_inner(
+    zalsa: &Zalsa,
+    database_key_index: DatabaseKeyIndex,
+    may_be_provisional: bool,
+    origin: QueryOriginRef<'_>,
+    cycle_strategy: CycleRecoveryStrategy,
+    flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
+    seen: &mut FxHashSet<DatabaseKeyIndex>,
+) {
+    // Only flatten dependencies of provisional queries, because only those
+    // contain cyclic dependencies.
+    if !may_be_provisional {
+        flattened_input_outputs.insert(QueryEdge::input(database_key_index));
+        return;
+    }
+
+    // There's nothing to do if we've visited this query before.
+    if !seen.insert(database_key_index) {
+        return;
+    }
+
+    let inputs = origin.inputs();
+
+    match cycle_strategy {
+        // For queries with cycle handling, simply extend the input/outputs, because
+        // they already flattened their own dependencies when completing the query.
+        CycleRecoveryStrategy::FallbackImmediate | CycleRecoveryStrategy::Fixpoint => {
+            flattened_input_outputs.extend(inputs.map(QueryEdge::input));
+        }
+        // For regular queries, recurse
+        CycleRecoveryStrategy::Panic => {
+            for input in inputs {
+                let ingredient = zalsa.lookup_ingredient(input.ingredient_index());
+                ingredient.flatten_cycle_head_dependencies(
+                    zalsa,
+                    input.key_index(),
+                    flattened_input_outputs,
+                    seen,
+                );
+            }
+        }
     }
 }
 

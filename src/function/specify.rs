@@ -123,21 +123,48 @@ where
             None => return,
         };
 
-        // If we are marking this as validated, it must be a value that was
-        // assigned by `executor`.
-        match memo.revisions.origin.as_ref() {
-            QueryOriginRef::Assigned(by_query) => assert_eq!(by_query, executor),
-            _ => panic!(
-                "expected a query assigned by `{:?}`, not `{:?}`",
-                executor, memo.revisions.origin,
-            ),
-        }
-
         let database_key_index = self.database_key_index(key);
-        memo.mark_as_verified(zalsa, database_key_index);
-        #[cfg(feature = "accumulator")]
-        memo.revisions
-            .accumulated_inputs
-            .store(InputAccumulatedValues::Empty);
+        validate_specified_value_inner(
+            zalsa,
+            executor,
+            database_key_index,
+            memo.revisions.origin.as_ref(),
+            &memo.revisions,
+            &memo.verified_at,
+        );
     }
+}
+
+/// Non-generic helper for [`IngredientImpl::validate_specified_value`].
+///
+/// Extracted to avoid monomorphizing this logic for every `Configuration` type.
+fn validate_specified_value_inner(
+    zalsa: &Zalsa,
+    executor: DatabaseKeyIndex,
+    database_key_index: DatabaseKeyIndex,
+    origin: QueryOriginRef<'_>,
+    revisions: &QueryRevisions,
+    verified_at: &AtomicRevision,
+) {
+    // If we are marking this as validated, it must be a value that was
+    // assigned by `executor`.
+    match origin {
+        QueryOriginRef::Assigned(by_query) => assert_eq!(by_query, executor),
+        _ => panic!(
+            "expected a query assigned by `{:?}`, not `{:?}`",
+            executor, origin,
+        ),
+    }
+
+    zalsa.event(&|| {
+        crate::Event::new(crate::EventKind::DidValidateMemoizedValue {
+            database_key: database_key_index,
+        })
+    });
+    verified_at.store(zalsa.current_revision());
+
+    #[cfg(feature = "accumulator")]
+    revisions
+        .accumulated_inputs
+        .store(InputAccumulatedValues::Empty);
 }
