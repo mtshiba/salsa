@@ -353,7 +353,14 @@ where
     /// returns the iteration in which this memo was created (always 0 except for cycle heads).
     fn remove_memo(&self, zalsa: &Zalsa, input: Id) {
         let memo_ingredient_index = self.memo_ingredient_index(zalsa, input);
-        self.remove_memo_from_table_for(zalsa, input, memo_ingredient_index);
+        // Only provisional state is discarded: a finalized member was accepted as
+        // canonical, and removing it would force the retry to redo (and possibly
+        // re-canonicalize) work that is already correct.
+        if let Some(memo) = self.get_memo_from_table_for(zalsa, input, memo_ingredient_index) {
+            if memo.header.may_be_provisional() || !memo.header.cycle_heads().is_empty() {
+                self.remove_memo_from_table_for(zalsa, input, memo_ingredient_index);
+            }
+        }
     }
 
     unsafe fn fetch_detached(
@@ -365,7 +372,10 @@ where
     ) {
         // SAFETY: The `db` belongs to the ingredient as per caller invariant.
         let db = unsafe { self.view_caster().downcast_unchecked(db) };
-        self.fetch(db, zalsa, zalsa_local, key);
+        // `refresh_memo`, not `fetch`: the caller (the top-level catch in `fetch`)
+        // owns the canonicalization chain. Going through `fetch` would start a nested
+        // catch loop per chain step and overflow the stack on long chains.
+        self.refresh_memo(db, zalsa, zalsa_local, key);
     }
 
     fn provisional_status<'db>(

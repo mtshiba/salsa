@@ -164,7 +164,6 @@ fn main() {
             "WillCheckCancellation",
             "WillCheckCancellation",
             "DidFinalizeCycle { database_key: cost_to_start(Id(403)), iteration: 1 }",
-            "WillCheckCancellation",
             "WillExecute { database_key: cost_to_start(Id(401)) }",
             "WillCheckCancellation",
             "WillCheckCancellation",
