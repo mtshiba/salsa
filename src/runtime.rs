@@ -216,11 +216,10 @@ pub(crate) mod cycle_groups {
         }
 
         /// Records `member` as part of the live group rooted at `root`, linked to the
-        /// cycle `heads` it read (itself, if the member is a head). Re-recording
-        /// replaces the links: components must reflect the converged dependency
-        /// structure, not couplings from earlier iterations that have since vanished
-        /// (a conditional cycle edge would otherwise keep two components glued
-        /// together and make canonicalization restart forever).
+        /// cycle `heads` it read (itself, if the member is a head). Links accumulate
+        /// across iterations: a coupling observed in any iteration glues the members
+        /// into one component, so the component covers the whole entangled region
+        /// rather than the (schedule-dependent) final-iteration slice of it.
         pub(crate) fn add_member(
             &self,
             root: DatabaseKeyIndex,
@@ -230,7 +229,12 @@ pub(crate) mod cycle_groups {
             let mut state = self.state.lock();
             debug_assert!(state.groups.contains_key(&root));
             state.member_index.insert(member, root);
-            state.member_heads.insert(member, heads.into_iter().collect());
+            let linked = state.member_heads.entry(member).or_default();
+            for head in heads {
+                if !linked.contains(&head) {
+                    linked.push(head);
+                }
+            }
         }
 
         /// The members of `head`'s connected component within the group rooted at
