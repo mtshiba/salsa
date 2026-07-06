@@ -69,6 +69,14 @@ impl DependencyGraph {
         owner: ThreadId,
         contested_key: DatabaseKeyIndex,
     ) -> Option<DatabaseKeyIndex> {
+        // ABLATION(alpha-only): requester always loses, as in 9e2a6239; the tombstone
+        // change is kept. Used to attribute the determinism regression between the
+        // tombstone (alpha) and the winner/BackOut protocol (beta).
+        if true {
+            let _ = (me, owner, contested_key);
+            return None;
+        }
+
         fn order(key: DatabaseKeyIndex) -> (u32, u64) {
             (key.ingredient_index().as_u32(), key.key_index().as_bits())
         }
