@@ -361,6 +361,12 @@ where
                         database_key_index,
                         [database_key_index],
                     );
+                    // SAFETY: The stack is not accessed reentrantly.
+                    unsafe {
+                        zalsa_local.with_query_stack_unchecked_mut(|stack| {
+                            stack.mark_cycle_member(database_key_index);
+                        });
+                    }
                 }
 
                 let cancellation_count = zalsa.runtime().cancellation_count();
