@@ -43,20 +43,12 @@ where
                         // the never-computed state) and wake parked threads.
                         if let Some(root) = zalsa_local.current_cycle_group() {
                             let groups = zalsa.runtime().cycle_groups();
-                            let is_panic = payload.downcast_ref::<Cancelled>().is_none();
                             for member in groups.members_of(root) {
                                 zalsa
                                     .lookup_ingredient(member.ingredient_index())
                                     .remove_memo(zalsa, member.key_index());
                             }
-                            groups.complete(
-                                root,
-                                if is_panic {
-                                    crate::runtime::cycle_groups::GroupOutcome::Panicked
-                                } else {
-                                    crate::runtime::cycle_groups::GroupOutcome::Aborted
-                                },
-                            );
+                            groups.complete(root);
                             zalsa_local.set_current_cycle_group(None);
                         }
                         match payload.downcast::<Cancelled>() {
@@ -194,17 +186,16 @@ where
                 // connected component concurrently, making the fixpoint trace (and with
                 // non-monotone recovery functions, the converged values) depend on thread
                 // scheduling. One side must back out entirely and retry from the top
-                // level. Prefer keeping an established cycle driver alive: with
-                // "requester always loses", an unrelated thread that merely holds a query
-                // the driver's evaluation reaches would keep killing the driver, and the
-                // cycle would re-form over and over (ratcheting the inherited iteration
-                // stamp until the iteration cap).
-                let i_am_driving = zalsa_local.query_stack_has_live_cycle_head(zalsa);
+                // level. The winner is decided by group roles (see `cross_cycle_walk`):
+                // a group owner beats non-group threads, and between two group owners
+                // the smaller root key wins — a total order, so the outcome does not
+                // depend on which side detected the cycle first.
+                let my_root = zalsa_local.current_cycle_group();
                 match zalsa.runtime().cross_cycle_decision(
                     zalsa,
                     owner,
                     database_key_index,
-                    i_am_driving,
+                    my_root,
                 ) {
                     Some(wake_key) => {
                         crate::tracing::debug!(
@@ -234,14 +225,35 @@ where
             {
                 if let Some(group) = zalsa.runtime().cycle_groups().group_of(database_key_index) {
                     if group.owner != crate::sync::thread::current().id() {
+                        // Park by blocking on the group root's claim, which the owner
+                        // holds for the entire evaluation. Unlike a condvar, this
+                        // registers an edge in the dependency graph, so a deadlock
+                        // (the owner needing a query this thread holds) is detected and
+                        // resolved through the ordinary cross-thread cycle rules instead
+                        // of hanging.
                         drop(claim_guard);
-                        match group.park() {
-                            crate::runtime::cycle_groups::GroupOutcome::Finalized
-                            | crate::runtime::cycle_groups::GroupOutcome::Aborted => return None,
-                            crate::runtime::cycle_groups::GroupOutcome::Panicked => {
-                                Cancelled::PropagatedPanic.throw()
+                        let root = group.root;
+                        let root_ingredient = zalsa.lookup_ingredient(root.ingredient_index());
+                        match root_ingredient.wait_for(zalsa, root.key_index()) {
+                            crate::function::WaitForResult::Running(running) => {
+                                if running.block_on(zalsa) == crate::runtime::BlockOutcome::BackOut
+                                {
+                                    cycle_loser_unwind(zalsa_local, database_key_index)
+                                }
+                            }
+                            crate::function::WaitForResult::Cycle { .. } => {
+                                // The group (transitively) waits on a query this thread
+                                // holds: the non-group side yields.
+                                cycle_loser_unwind(zalsa_local, database_key_index)
+                            }
+                            crate::function::WaitForResult::Available => {
+                                // Between the registry lookup and the claim probe the
+                                // group completed (or its owner is between claims);
+                                // retry.
+                                std::thread::yield_now();
                             }
                         }
+                        return None;
                     }
                 }
             }

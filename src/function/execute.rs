@@ -314,10 +314,7 @@ where
                     if outer_cycle.is_none() {
                         let zalsa_local = claim_guard.zalsa_local();
                         if let Some(root) = zalsa_local.current_cycle_group() {
-                            zalsa.runtime().cycle_groups().complete(
-                                root,
-                                crate::runtime::cycle_groups::GroupOutcome::Finalized,
-                            );
+                            zalsa.runtime().cycle_groups().complete(root);
                             zalsa_local.set_current_cycle_group(None);
                         }
                     }

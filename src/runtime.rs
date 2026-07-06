@@ -25,6 +25,7 @@ pub struct Runtime {
     cancellation_count: AtomicU8,
 
     /// In-flight cycle groups (GODE), see [`cycle_groups::CycleGroups`].
+    #[cfg_attr(feature = "persistence", serde(skip))]
     cycle_groups: cycle_groups::CycleGroups,
 
     /// Stores the "last change" revision for values of each duration.
@@ -156,7 +157,7 @@ pub(crate) mod cycle_groups {
 
     use crate::key::DatabaseKeyIndex;
     use crate::sync::thread::ThreadId;
-    use crate::sync::{Arc, Condvar, Mutex};
+    use crate::sync::{Arc, Mutex};
 
     pub(crate) struct CycleGroups {
         state: Mutex<GroupsState>,
@@ -168,30 +169,13 @@ pub(crate) mod cycle_groups {
         groups: FxHashMap<DatabaseKeyIndex, Arc<GroupState>>,
         /// Member key -> root key of the live group it belongs to.
         member_index: FxHashMap<DatabaseKeyIndex, DatabaseKeyIndex>,
+        /// Owner thread -> root key of the live group it is evaluating.
+        owner_index: FxHashMap<ThreadId, DatabaseKeyIndex>,
     }
 
     pub(crate) struct GroupState {
         pub(crate) root: DatabaseKeyIndex,
         pub(crate) owner: ThreadId,
-        phase: Mutex<GroupPhase>,
-        cv: Condvar,
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) enum GroupPhase {
-        Running,
-        Done(GroupOutcome),
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) enum GroupOutcome {
-        /// The group converged; all member memos are finalized in the table.
-        Finalized,
-        /// The group was aborted (e.g. lost a group-vs-group conflict); all member memos
-        /// were removed. Parked threads retry.
-        Aborted,
-        /// The group's evaluation panicked; parked threads propagate the panic.
-        Panicked,
     }
 
     impl Default for CycleGroups {
@@ -214,14 +198,10 @@ pub(crate) mod cycle_groups {
             if state.groups.contains_key(&root) || state.member_index.contains_key(&root) {
                 return None;
             }
-            let group = Arc::new(GroupState {
-                root,
-                owner,
-                phase: Mutex::new(GroupPhase::Running),
-                cv: Condvar::default(),
-            });
+            let group = Arc::new(GroupState { root, owner });
             state.groups.insert(root, Arc::clone(&group));
             state.member_index.insert(root, root);
+            state.owner_index.insert(owner, root);
             Some(group)
         }
 
@@ -239,6 +219,11 @@ pub(crate) mod cycle_groups {
             state.groups.get(root).cloned()
         }
 
+        /// The root of the live group owned (evaluated) by `thread`, if any.
+        pub(crate) fn root_owned_by(&self, thread: ThreadId) -> Option<DatabaseKeyIndex> {
+            self.state.lock().owner_index.get(&thread).copied()
+        }
+
         /// The members of the live group rooted at `root` (excluding queries that were
         /// never recorded).
         pub(crate) fn members_of(&self, root: DatabaseKeyIndex) -> Vec<DatabaseKeyIndex> {
@@ -250,31 +235,14 @@ pub(crate) mod cycle_groups {
                 .collect()
         }
 
-        /// Completes the group rooted at `root`: removes it from the registry and wakes
-        /// every parked thread with `outcome`.
-        pub(crate) fn complete(&self, root: DatabaseKeyIndex, outcome: GroupOutcome) {
-            let group = {
-                let mut state = self.state.lock();
-                state.member_index.retain(|_, r| *r != root);
-                state.groups.remove(&root)
-            };
-            if let Some(group) = group {
-                *group.phase.lock() = GroupPhase::Done(outcome);
-                group.cv.notify_all();
-            }
-        }
-    }
-
-    impl GroupState {
-        /// Parks the current thread until the group completes.
-        pub(crate) fn park(&self) -> GroupOutcome {
-            let mut phase = self.phase.lock();
-            loop {
-                match *phase {
-                    GroupPhase::Done(outcome) => return outcome,
-                    GroupPhase::Running => phase = self.cv.wait(phase),
-                }
-            }
+        /// Completes the group rooted at `root`, removing it from the registry. Threads
+        /// blocked on the root's claim are woken through the ordinary claim-release
+        /// machinery; the registry itself has no waiters.
+        pub(crate) fn complete(&self, root: DatabaseKeyIndex) {
+            let mut state = self.state.lock();
+            state.member_index.retain(|_, r| *r != root);
+            state.owner_index.retain(|_, r| *r != root);
+            state.groups.remove(&root);
         }
     }
 }
@@ -492,11 +460,11 @@ impl Runtime {
         zalsa: &Zalsa,
         owner: ThreadId,
         contested_key: DatabaseKeyIndex,
-        i_am_driving: bool,
+        my_root: Option<DatabaseKeyIndex>,
     ) -> Option<DatabaseKeyIndex> {
         let me = thread::current().id();
         let dg = self.dependency_graph.lock();
-        dg.cross_cycle_walk(zalsa, me, owner, contested_key, i_am_driving)
+        dg.cross_cycle_walk(zalsa, self, me, owner, contested_key, my_root)
     }
 
     /// Block until `other_id` completes executing `database_key`, or return `BlockResult::Cycle`
