@@ -30,11 +30,6 @@ pub(crate) struct ActiveQuery {
     /// untracked read, this will be set to the most recent revision.
     changed_at: Revision,
 
-    /// True while this frame's key is a member of the thread's current cycle group
-    /// (it was hit by a back edge while in flight). Tracked so group completion can
-    /// test "no in-flight member frames" in O(1) (see `QueryStack::cycle_members`).
-    cycle_member: bool,
-
     /// Inputs: Set of subqueries that were accessed thus far.
     /// Outputs: Tracks values written by this query. Could be...
     ///
@@ -207,7 +202,6 @@ impl ActiveQuery {
             database_key_index,
             durability: Durability::MAX,
             changed_at: Revision::start(),
-            cycle_member: false,
             input_outputs: FxIndexSet::default(),
             untracked_read: false,
             disambiguator_map: Default::default(),
@@ -229,7 +223,6 @@ impl ActiveQuery {
             database_key_index: _,
             durability,
             changed_at,
-            cycle_member: _,
             input_outputs: _,
             untracked_read,
             ref mut disambiguator_map,
@@ -273,7 +266,6 @@ impl ActiveQuery {
             database_key_index: _,
             durability: _,
             changed_at: _,
-            cycle_member: _,
             input_outputs,
             untracked_read: _,
             disambiguator_map,
@@ -297,7 +289,6 @@ impl ActiveQuery {
             database_key_index,
             durability,
             changed_at,
-            cycle_member,
             input_outputs,
             untracked_read,
             disambiguator_map,
@@ -311,7 +302,6 @@ impl ActiveQuery {
         *database_key_index = new_database_key_index;
         *durability = Durability::MAX;
         *changed_at = Revision::start();
-        *cycle_member = false;
         *untracked_read = false;
         debug_assert!(
             input_outputs.is_empty(),
@@ -352,8 +342,6 @@ impl DetachedInputOutputs {
 pub(crate) struct QueryStack {
     stack: Vec<ActiveQuery>,
     len: usize,
-    /// Number of in-flight frames with `cycle_member` set.
-    cycle_members: usize,
 }
 
 impl std::fmt::Debug for QueryStack {
@@ -457,30 +445,7 @@ impl QueryStack {
         self.len -= 1;
         let active_query = &mut self.stack[self.len];
         debug_assert_eq!(active_query.database_key_index, key, "unbalanced push/pop");
-        if active_query.cycle_member {
-            active_query.cycle_member = false;
-            self.cycle_members -= 1;
-        }
         active_query
-    }
-
-    /// Marks the in-flight frame for `key` as a member of the current cycle group.
-    pub(crate) fn mark_cycle_member(&mut self, key: DatabaseKeyIndex) {
-        if let Some(frame) = self[..]
-            .iter_mut()
-            .rev()
-            .find(|frame| frame.database_key_index == key)
-        {
-            if !frame.cycle_member {
-                frame.cycle_member = true;
-                self.cycle_members += 1;
-            }
-        }
-    }
-
-    /// The number of in-flight frames that belong to the current cycle group.
-    pub(crate) fn cycle_members(&self) -> usize {
-        self.cycle_members
     }
 }
 

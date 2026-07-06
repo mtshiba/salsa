@@ -114,18 +114,26 @@ where
         );
 
         // GODE: the thread's cycle group is done once no in-flight frame belongs to it
-        // anymore (every in-flight member was hit by a back edge and is marked on its
-        // frame). This must be checked at every query completion (not only at cycle-head
+        // anymore. This must be checked at every query completion (not only at cycle-head
         // convergence): the last member frame can finish through ordinary completion when
         // its cycle was resolved during an inner head's iteration.
         let zalsa_local = claim_guard.zalsa_local();
         if let Some(root) = zalsa_local.current_cycle_group() {
+            let groups = zalsa.runtime().cycle_groups();
+            let member_set = groups
+                .members_of(root)
+                .into_iter()
+                .collect::<crate::hash::FxHashSet<_>>();
             // SAFETY: The stack is not accessed reentrantly.
-            let batch_live =
-                unsafe { zalsa_local.with_query_stack_unchecked(|stack| stack.cycle_members()) }
-                    > 0;
+            let batch_live = unsafe {
+                zalsa_local.with_query_stack_unchecked(|stack| {
+                    stack
+                        .iter()
+                        .any(|query| member_set.contains(&query.database_key_index))
+                })
+            };
             if !batch_live {
-                zalsa.runtime().cycle_groups().complete(root);
+                groups.complete(root);
                 zalsa_local.set_current_cycle_group(None);
             }
         }
