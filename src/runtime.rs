@@ -61,7 +61,11 @@ pub(crate) enum BlockResult<'me> {
     ///
     /// The lock is hold by the current thread or there's another thread that is waiting on the current thread,
     /// and blocking this thread on the other thread would result in a deadlock/cycle.
-    Cycle,
+    ///
+    /// `same_thread` is `true` when the lock is held by the current thread itself (an
+    /// intra-thread cycle over the query stack). `false` means the cycle spans threads:
+    /// another thread transitively waits on us.
+    Cycle { same_thread: bool },
 }
 
 pub(crate) enum BlockTransferredResult<'me> {
@@ -92,7 +96,7 @@ impl<'me> BlockOnTransferredOwner<'me> {
     pub(super) fn block(self, query_mutex_guard: SyncGuard<'me>) -> BlockResult<'me> {
         // Cycle in the same thread.
         if self.thread_id == self.other_id {
-            return BlockResult::Cycle;
+            return BlockResult::Cycle { same_thread: true };
         }
 
         if self.dg.depends_on(self.other_id, self.thread_id) {
@@ -102,7 +106,7 @@ impl<'me> BlockOnTransferredOwner<'me> {
                 self.other_id,
                 thread_id = self.thread_id
             );
-            return BlockResult::Cycle;
+            return BlockResult::Cycle { same_thread: false };
         }
 
         BlockResult::Running(Running(Box::new(BlockedOnInner {
@@ -322,7 +326,7 @@ impl Runtime {
         let thread_id = thread::current().id();
         // Cycle in the same thread.
         if thread_id == other_id {
-            return BlockResult::Cycle;
+            return BlockResult::Cycle { same_thread: true };
         }
 
         let dg = self.dependency_graph.lock();
@@ -331,7 +335,7 @@ impl Runtime {
             crate::tracing::debug!(
                 "block_on: cycle detected for {database_key:?} in thread {thread_id:?} on {other_id:?}"
             );
-            return BlockResult::Cycle;
+            return BlockResult::Cycle { same_thread: false };
         }
 
         BlockResult::Running(Running(Box::new(BlockedOnInner {

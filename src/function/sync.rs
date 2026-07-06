@@ -32,6 +32,11 @@ pub(crate) enum ClaimResult<'a, Guard = ClaimGuard<'a>> {
         /// `b`. If the thread claiming `b` tries to claim `a`, then this results in a cycle except when calling
         /// [`SyncTable::try_claim`] with [`Reentrant::Allow`].
         inner: bool,
+        /// `true` when the cycle is confined to the current thread's query stack. `false`
+        /// when the cycle spans threads (another thread transitively waits on this one);
+        /// in that case the claimer must not join the cycle if deterministic execution is
+        /// desired, see `Cancelled::CycleLoser`.
+        same_thread: bool,
     },
 }
 
@@ -87,7 +92,7 @@ impl SyncTable {
                         ) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
-                                BlockResult::Cycle => ClaimResult::Cycle { inner: false },
+                                BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
                                 BlockResult::Running(running) => ClaimResult::Running(running),
                             },
                         };
@@ -109,7 +114,7 @@ impl SyncTable {
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
-                    BlockResult::Cycle => ClaimResult::Cycle { inner: false },
+                    BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
                 }
             }
             std::collections::hash_map::Entry::Vacant(vacant_entry) => {
@@ -146,7 +151,7 @@ impl SyncTable {
                         return match self.peek_claim_transferred(zalsa, occupied_entry, reentrant) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
-                                BlockResult::Cycle => ClaimResult::Cycle { inner: false },
+                                BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
                                 BlockResult::Running(running) => ClaimResult::Running(running),
                             },
                         };
@@ -168,7 +173,7 @@ impl SyncTable {
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
-                    BlockResult::Cycle => ClaimResult::Cycle { inner: false },
+                    BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
                 }
             }
             std::collections::hash_map::Entry::Vacant(_) => ClaimResult::Claimed(()),
@@ -209,7 +214,7 @@ impl SyncTable {
                     mode: ReleaseMode::SelfOnly,
                 }))
             }
-            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true }),
+            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true }),
             BlockTransferredResult::OwnedBy(other_thread) => {
                 entry.get_mut().anyone_waiting = true;
                 Err(other_thread)
@@ -251,7 +256,7 @@ impl SyncTable {
             BlockTransferredResult::ImTheOwner if reentrant.is_allow() => {
                 Ok(ClaimResult::Claimed(()))
             }
-            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true }),
+            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true }),
             BlockTransferredResult::OwnedBy(other_thread) => {
                 entry.get_mut().anyone_waiting = true;
                 Err(other_thread)
@@ -331,7 +336,9 @@ impl<'me> ClaimGuard<'me> {
     fn release_panicking(&self) {
         let mut syncs = self.sync_table.syncs.lock();
         let state = syncs.remove(&self.key_index).expect("key claimed twice?");
-        let result = if self.zalsa_local.should_trigger_local_cancellation() {
+        let result = if self.zalsa_local.should_trigger_local_cancellation()
+            || self.zalsa_local.is_cycle_backout()
+        {
             WaitResult::Cancelled
         } else {
             WaitResult::Panicked

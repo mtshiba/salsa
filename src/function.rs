@@ -431,7 +431,7 @@ where
             .peek_claim(zalsa, key_index, Reentrancy::Deny)
         {
             ClaimResult::Running(blocked_on) => WaitForResult::Running(blocked_on),
-            ClaimResult::Cycle { inner } => WaitForResult::Cycle { inner },
+            ClaimResult::Cycle { inner, .. } => WaitForResult::Cycle { inner },
             ClaimResult::Claimed(()) => WaitForResult::Available,
         }
     }

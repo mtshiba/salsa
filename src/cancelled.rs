@@ -18,6 +18,12 @@ pub enum Cancelled {
 
     /// The query was blocked on another thread, and that thread panicked.
     PropagatedPanic,
+
+    /// The query attempted to claim a query on another thread and that would have formed a
+    /// cross-thread cycle. To keep fixpoint iteration deterministic, the requesting side
+    /// backs out entirely (releasing all of its claims) and retries from the top level once
+    /// the winning thread has finalized the cycle.
+    CycleLoser,
 }
 
 impl Cancelled {
@@ -49,6 +55,7 @@ impl std::fmt::Display for Cancelled {
             Cancelled::Local => "local cancellation request",
             Cancelled::PendingWrite => "pending write",
             Cancelled::PropagatedPanic => "propagated panic",
+            Cancelled::CycleLoser => "losing a cross-thread cycle race",
         };
         f.write_str("cancelled because of ")?;
         f.write_str(why)

@@ -5,7 +5,7 @@ use crate::function::sync::ClaimResult;
 use crate::function::{Configuration, IngredientImpl, Reentrancy};
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::{QueryRevisions, ZalsaLocal};
-use crate::{DatabaseKeyIndex, Id};
+use crate::{Cancelled, DatabaseKeyIndex, Id};
 
 impl<C> IngredientImpl<C>
 where
@@ -26,7 +26,35 @@ where
         #[cfg(feature = "detailed-trace")]
         let _span = crate::tracing::debug_span!("fetch", query = ?database_key_index).entered();
 
-        let memo = self.refresh_memo(db, zalsa, zalsa_local, id);
+        // A query that lost a cross-thread cycle race unwinds its entire stack (see
+        // `Cancelled::CycleLoser`); the retry must happen where the stack is empty.
+        // Only the top-level entry point can catch it.
+        let memo = if zalsa_local.query_stack_is_empty() {
+            loop {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.refresh_memo(db, zalsa, zalsa_local, id)
+                })) {
+                    Ok(memo) => break memo,
+                    Err(payload) => match payload.downcast::<Cancelled>() {
+                        Ok(cancelled) => match *cancelled {
+                            Cancelled::CycleLoser => {
+                                crate::tracing::debug!(
+                                    "{database_key_index:?}: lost a cross-thread cycle race; retrying from the top level"
+                                );
+                                zalsa_local.end_cycle_backout();
+                                // Give the winning thread time to finalize the cycle.
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            other => other.throw(),
+                        },
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    },
+                }
+            }
+        } else {
+            self.refresh_memo(db, zalsa, zalsa_local, id)
+        };
 
         // SAFETY: We just refreshed the memo so it is guaranteed to contain a value now.
         let memo_value = unsafe { memo.value.as_ref().unwrap_unchecked() };
@@ -120,7 +148,7 @@ where
                 let _ = blocked_on.block_on(zalsa);
                 return None;
             }
-            ClaimResult::Cycle { .. } => {
+            ClaimResult::Cycle { same_thread: true, .. } => {
                 return Some(self.fetch_cold_cycle(
                     zalsa,
                     zalsa_local,
@@ -130,7 +158,57 @@ where
                     memo_ingredient_index,
                 ));
             }
+            ClaimResult::Cycle { same_thread: false, .. } => {
+                // Joining a cross-thread cycle would let two threads iterate one strongly
+                // connected component concurrently, making the fixpoint trace (and with
+                // non-monotone recovery functions, the converged values) depend on thread
+                // scheduling. Back out entirely instead; the other thread completes the
+                // cycle alone and we retry from the top level.
+                cycle_loser_unwind(zalsa_local, database_key_index)
+            }
         };
+
+        // Deterministic fixpoint: never execute or reuse another thread's in-flight
+        // provisional cycle state. If the memo is provisional for cycle heads that are not
+        // on our own query stack and at least one of those heads is itself still
+        // provisional (the cycle is genuinely being iterated, not merely pending lazy
+        // finalization), the owning thread is between iterations; wait for it to finalize
+        // instead of re-executing the participant (which would make this thread a
+        // concurrent co-iterator of the cycle).
+        if let Some(old_memo) = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index) {
+            if old_memo.value.is_some()
+                && old_memo.header.may_be_provisional()
+                && old_memo.header.verified_at.load() == zalsa.current_revision()
+            {
+                let heads = old_memo.header.cycle_heads();
+                if !heads.is_empty()
+                    && !zalsa_local.query_stack_contains_any(heads)
+                    && heads.iter().any(|head| {
+                        let head_ingredient = zalsa
+                            .lookup_ingredient(head.database_key_index.ingredient_index());
+                        // A *live* cycle keeps its head claimed for the entire iteration
+                        // (the driving thread holds the head's claim guard across all
+                        // iterations), so park only while the head runs on *another*
+                        // thread. An unclaimed provisional head is an abandoned leftover
+                        // that will never finalize, and a head claimed by the current
+                        // thread (e.g. while verifying without a query frame) must not
+                        // park us against ourselves; fall through and re-execute then.
+                        matches!(
+                            head_ingredient
+                                .provisional_status(zalsa, head.database_key_index.key_index()),
+                            Some(crate::cycle::ProvisionalStatus::Provisional { .. })
+                        ) && matches!(
+                            head_ingredient.wait_for(zalsa, head.database_key_index.key_index()),
+                            crate::function::WaitForResult::Running(_)
+                        )
+                    })
+                {
+                    drop(claim_guard);
+                    std::thread::yield_now();
+                    return None;
+                }
+            }
+        }
 
         // Now that we've claimed the item, check again to see if there's a "hot" value.
         let opt_old_memo = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index);
@@ -234,4 +312,18 @@ where
             }
         }
     }
+}
+
+/// Unwinds the current thread out of all of its queries because it lost a cross-thread
+/// cycle race. The local cancellation token is set first so that the claims released
+/// during unwinding report `WaitResult::Cancelled` (waiters retry) rather than
+/// `WaitResult::Panicked` (waiters propagate the panic).
+#[cold]
+#[inline(never)]
+fn cycle_loser_unwind(zalsa_local: &ZalsaLocal, database_key_index: DatabaseKeyIndex) -> ! {
+    crate::tracing::debug!(
+        "{database_key_index:?}: cross-thread cycle detected; unwinding as the losing side"
+    );
+    zalsa_local.begin_cycle_backout();
+    Cancelled::CycleLoser.throw()
 }

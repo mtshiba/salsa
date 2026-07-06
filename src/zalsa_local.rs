@@ -1,5 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::fmt;
 use std::fmt::Formatter;
 use std::marker::PhantomData;
@@ -46,6 +46,13 @@ pub struct ZalsaLocal {
     most_recent_pages: UnsafeCell<FxHashMap<IngredientIndex, PageIndex>>,
 
     cancelled: CancellationToken,
+
+    /// Set while this thread unwinds because it lost a cross-thread cycle race
+    /// (see `Cancelled::CycleLoser`). Distinct from the cancellation token: the token can
+    /// be temporarily disabled (`DisableLocalCancellationGuard`), but a cycle back-out must
+    /// always release claims as `WaitResult::Cancelled` and must never leave panic-poisoned
+    /// provisional memos behind.
+    cycle_backout: Cell<bool>,
 }
 
 /// A cancellation token that can be used to cancel a query computation for a specific local `Database`.
@@ -91,6 +98,7 @@ impl ZalsaLocal {
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             cancelled: CancellationToken::default(),
+            cycle_backout: Cell::new(false),
         }
     }
 
@@ -237,6 +245,28 @@ impl ZalsaLocal {
             .ok()
             .as_ref()
             .map(|stack| f(stack))
+    }
+
+    /// Whether the current thread has no queries on its stack (i.e. this is a top-level
+    /// entry into the database).
+    #[inline]
+    pub(crate) fn query_stack_is_empty(&self) -> bool {
+        // SAFETY: We do not access the query stack reentrantly.
+        unsafe { self.with_query_stack_unchecked(|stack| stack.len() == 0) }
+    }
+
+    /// Whether any query on the current thread's stack is one of the given cycle heads.
+    /// Used to distinguish a cycle participant (which may see the cycle's provisional
+    /// values) from an unrelated thread (which must wait for the final values).
+    pub(crate) fn query_stack_contains_any(&self, heads: &CycleHeads) -> bool {
+        // SAFETY: We do not access the query stack reentrantly.
+        unsafe {
+            self.with_query_stack_unchecked(|stack| {
+                stack
+                    .iter()
+                    .any(|active_query| heads.contains(&active_query.database_key_index))
+            })
+        }
     }
 
     /// Returns the index of the active query along with its *current* durability/changed-at
@@ -467,6 +497,21 @@ impl ZalsaLocal {
     #[inline]
     pub(crate) fn uncancel(&self) {
         self.cancelled.reset();
+    }
+
+    #[inline]
+    pub(crate) fn begin_cycle_backout(&self) {
+        self.cycle_backout.set(true);
+    }
+
+    #[inline]
+    pub(crate) fn end_cycle_backout(&self) {
+        self.cycle_backout.set(false);
+    }
+
+    #[inline]
+    pub(crate) fn is_cycle_backout(&self) -> bool {
+        self.cycle_backout.get()
     }
 
     #[inline]

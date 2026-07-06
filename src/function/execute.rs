@@ -153,8 +153,13 @@ where
             }
         }
 
-        let _poison_guard =
-            PoisonProvisionalIfPanicking::new(self, zalsa, id, memo_ingredient_index);
+        let _poison_guard = PoisonProvisionalIfPanicking::new(
+            self,
+            zalsa,
+            claim_guard.zalsa_local(),
+            id,
+            memo_ingredient_index,
+        );
 
         let (new_value, completed_query) = loop {
             let active_query = claim_guard.zalsa_local().push_query(database_key_index);
@@ -524,6 +529,7 @@ impl Drop for DisableLocalCancellationGuard<'_> {
 struct PoisonProvisionalIfPanicking<'a, C: Configuration> {
     ingredient: &'a IngredientImpl<C>,
     zalsa: &'a Zalsa,
+    zalsa_local: &'a ZalsaLocal,
     id: Id,
     memo_ingredient_index: MemoIngredientIndex,
 }
@@ -532,12 +538,14 @@ impl<'a, C: Configuration> PoisonProvisionalIfPanicking<'a, C> {
     fn new(
         ingredient: &'a IngredientImpl<C>,
         zalsa: &'a Zalsa,
+        zalsa_local: &'a ZalsaLocal,
         id: Id,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Self {
         Self {
             ingredient,
             zalsa,
+            zalsa_local,
             id,
             memo_ingredient_index,
         }
@@ -547,9 +555,22 @@ impl<'a, C: Configuration> PoisonProvisionalIfPanicking<'a, C> {
 impl<C: Configuration> Drop for PoisonProvisionalIfPanicking<'_, C> {
     fn drop(&mut self) {
         if thread::panicking() {
+            // A cancellation unwind (including a cross-thread cycle-race back-out, see
+            // `Cancelled::CycleLoser`) is not a real panic: the query must simply be
+            // re-executed later. Stamp the placeholder with a mismatched cancellation
+            // count so every reader treats it as stale and re-executes, instead of
+            // propagating a panic via `previous_iteration`.
+            let cancellation_count = self.zalsa.runtime().cancellation_count();
+            let cancellation_count = if self.zalsa_local.should_trigger_local_cancellation()
+                || self.zalsa_local.is_cycle_backout()
+            {
+                cancellation_count.wrapping_sub(1)
+            } else {
+                cancellation_count
+            };
             let revisions = QueryRevisions::fixpoint_initial(
                 self.ingredient.database_key_index(self.id),
-                IterationStamp::initial(self.zalsa.runtime().cancellation_count()),
+                IterationStamp::initial(cancellation_count),
             );
 
             let memo = Memo::new(None, self.zalsa.current_revision(), revisions);
