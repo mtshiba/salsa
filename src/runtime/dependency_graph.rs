@@ -69,6 +69,15 @@ impl DependencyGraph {
         owner: ThreadId,
         contested_key: DatabaseKeyIndex,
     ) -> Option<DatabaseKeyIndex> {
+        // v3: the requesting side always loses. Measurements on ty (steam.py) showed the
+        // winner/BackOut protocol *reduced* completion rates under contention (7% vs 30%
+        // completions at 32 threads) without being needed for determinism; the machinery
+        // is kept for future experiments.
+        if true {
+            let _ = (me, owner, contested_key);
+            return None;
+        }
+
         fn order(key: DatabaseKeyIndex) -> (u32, u64) {
             (key.ingredient_index().as_u32(), key.key_index().as_bits())
         }

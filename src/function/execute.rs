@@ -235,6 +235,30 @@ where
                 memo
             });
 
+            let last_provisional_memo = if last_provisional_memo.value.is_none() {
+                // The memo in the table is a cancellation/back-out tombstone (see
+                // `PoisonProvisionalIfPanicking`): the cycle re-formed over leftovers of a
+                // backed-out run without re-entering this head through `fetch_cold_cycle`
+                // (a leftover participant validated as same-iteration against the
+                // tombstone's initial stamp). Seed a fresh fixpoint initial in place.
+                crate::tracing::debug!(
+                    "{database_key_index:?}: tombstoned cycle head; seeding a fresh initial value"
+                );
+                let initial_revisions = QueryRevisions::fixpoint_initial(
+                    database_key_index,
+                    IterationStamp::initial(zalsa.runtime().cancellation_count()),
+                );
+                let initial_value = C::cycle_initial(db, id, C::id_to_input(zalsa, id));
+                self.insert_memo(
+                    zalsa,
+                    id,
+                    Memo::new(Some(initial_value), zalsa.current_revision(), initial_revisions),
+                    memo_ingredient_index,
+                )
+            } else {
+                last_provisional_memo
+            };
+
             let last_provisional_value = last_provisional_memo.value.as_ref();
 
             let last_provisional_value = last_provisional_value.expect(
@@ -375,15 +399,10 @@ impl MemoHeader {
             return None;
         }
 
-        // A value-less memo that is marked `verified_final` is a cancellation/back-out
-        // tombstone (see `PoisonProvisionalIfPanicking`), not a panic: restart from a
-        // fresh iteration.
-        if !has_value
-            && self
-                .revisions
-                .verified_final
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // A value-less memo with `Durability::MIN` is a cancellation/back-out tombstone
+        // (see `PoisonProvisionalIfPanicking`), not a panic: restart from a fresh
+        // iteration.
+        if !has_value && self.revisions.durability == crate::Durability::MIN {
             return None;
         }
 
@@ -574,23 +593,18 @@ impl<C: Configuration> Drop for PoisonProvisionalIfPanicking<'_, C> {
 
             // A cancellation unwind (including a cross-thread cycle-race back-out, see
             // `Cancelled::CycleLoser`) is not a real panic: the query must simply be
-            // re-executed later. Mark the placeholder as a tombstone with the otherwise
-            // impossible combination "no value + verified_final": `previous_iteration`
-            // then restarts from a fresh iteration instead of propagating a panic, and
-            // `provisional_status` reports `Final` with the initial stamp, which fails
-            // the head-iteration comparison in `validate_provisional` so dependents
-            // re-execute instead of reusing state derived from the backed-out run.
+            // re-executed later. The placeholder keeps the exact shape of a real-panic
+            // poison (value-less, provisional, self-headed with the current stamp), so
+            // every validation path treats it like an unresolved provisional and
+            // re-executes dependents; only `previous_iteration` needs to distinguish the
+            // two to restart from a fresh iteration instead of propagating a panic. The
+            // marker is the durability: `fixpoint_initial` uses `Durability::MAX`, and a
+            // value-less memo's durability is otherwise never consulted within the same
+            // revision.
             if self.zalsa_local.should_trigger_local_cancellation()
                 || self.zalsa_local.is_cycle_backout()
             {
-                *revisions.verified_final.get_mut() = true;
-                // `verified_final` memos must not carry cycle heads (see
-                // `MemoHeader::new`); the tombstone is identified by
-                // "no value + verified_final" alone.
-                revisions.set_cycle_heads(
-                    CycleHeads::default(),
-                    IterationStamp::initial(self.zalsa.runtime().cancellation_count()),
-                );
+                revisions.durability = crate::Durability::MIN;
             }
 
             let memo = Memo::new(None, self.zalsa.current_revision(), revisions);

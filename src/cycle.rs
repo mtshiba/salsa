@@ -505,6 +505,9 @@ pub enum ProvisionalStatus<'db> {
         iteration: IterationStamp,
         verified_at: Revision,
         cycle_heads: &'db CycleHeads,
+        /// Whether the memo carries a value. A value-less provisional is a panic poison
+        /// or a cancellation/back-out tombstone; it must never validate dependents.
+        has_value: bool,
     },
     Final {
         iteration: IterationStamp,

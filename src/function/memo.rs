@@ -449,9 +449,16 @@ impl Iterator for TryClaimCycleHeadsIter<'_> {
                 };
                 let (current_iteration, verified_at) = match provisional_status {
                     ProvisionalStatus::Provisional {
+                        has_value: false, ..
+                    } => {
+                        // A value-less provisional head is a panic poison or a back-out
+                        // tombstone; memos recorded against it must not validate.
+                        return Some(TryClaimHeadsResult::Available);
+                    }
+                    ProvisionalStatus::Provisional {
                         iteration,
                         verified_at,
-                        cycle_heads: _,
+                        ..
                     } => (iteration, verified_at),
                     ProvisionalStatus::Final {
                         iteration,
