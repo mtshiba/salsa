@@ -235,6 +235,29 @@ where
                 memo
             });
 
+            let last_provisional_memo = if last_provisional_memo.value.is_none() {
+                // The memo in the table is a poison left behind by a cancelled or
+                // backed-out run: the cycle re-formed over leftovers without re-entering
+                // this head through `fetch_cold_cycle`. Seed a fresh fixpoint initial in
+                // place.
+                crate::tracing::debug!(
+                    "{database_key_index:?}: poisoned cycle head; seeding a fresh initial value"
+                );
+                let initial_revisions = QueryRevisions::fixpoint_initial(
+                    database_key_index,
+                    IterationStamp::initial(zalsa.runtime().cancellation_count()),
+                );
+                let initial_value = C::cycle_initial(db, id, C::id_to_input(zalsa, id));
+                self.insert_memo(
+                    zalsa,
+                    id,
+                    Memo::new(Some(initial_value), zalsa.current_revision(), initial_revisions),
+                    memo_ingredient_index,
+                )
+            } else {
+                last_provisional_memo
+            };
+
             let last_provisional_value = last_provisional_memo.value.as_ref();
 
             let last_provisional_value = last_provisional_value.expect(
@@ -672,6 +695,20 @@ fn collect_all_cycle_heads(
         // If this invariant is violated, it means that this query participates in a cycle,
         // but it wasn't executed in the last iteration of said cycle.
         assert!(provisional_status.is_provisional());
+
+        // A head whose stamp carries a stale cancellation count is a poison left behind by
+        // a cancelled or backed-out run (see `PoisonProvisionalIfPanicking` and
+        // `Cancelled::CycleLoser`). Its recorded stamps must not merge into the active
+        // query's head set — `CycleHeads::insert` would fail the iteration-equality
+        // assertion against current-run stamps. Memos referencing such a head fail
+        // validation and re-execute anyway.
+        let status_stamp = match provisional_status {
+            crate::cycle::ProvisionalStatus::Provisional { iteration, .. }
+            | crate::cycle::ProvisionalStatus::Final { iteration, .. } => iteration,
+        };
+        if status_stamp.cancellation_count() != zalsa.runtime().cancellation_count() {
+            return (IterationStamp::default(), false);
+        }
 
         for head in provisional_status.cycle_heads() {
             let iteration = head.iteration.load();
