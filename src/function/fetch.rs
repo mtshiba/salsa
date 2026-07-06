@@ -1,6 +1,7 @@
 use crate::cycle::{CycleRecoveryStrategy, IterationStamp};
 use crate::function::eviction::EvictionPolicy;
 use crate::function::memo::Memo;
+use crate::function::execute::DisableLocalCancellationGuard;
 use crate::function::sync::ClaimResult;
 use crate::function::{Configuration, IngredientImpl, Reentrancy};
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
@@ -30,12 +31,33 @@ where
         // `Cancelled::CycleLoser`); the retry must happen where the stack is empty.
         // Only the top-level entry point can catch it.
         let memo = if zalsa_local.query_stack_is_empty() {
+            // A cycle group that converged from a non-canonical entry is re-evaluated
+            // here, detached, from its minimum member (GODE I-D) before the original
+            // query is retried.
+            let mut pending_canonical: Option<crate::DatabaseKeyIndex> = None;
             loop {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(canonical) = pending_canonical {
+                        // The re-evaluation continues a fixpoint iteration that upstream
+                        // completes before honoring local cancellation; defer it for
+                        // exactly that scope (dropped before the retry below).
+                        let _deferral = DisableLocalCancellationGuard::new(zalsa_local);
+                        let ingredient = zalsa.lookup_ingredient(canonical.ingredient_index());
+                        // SAFETY: `db` is the database this ingredient belongs to.
+                        unsafe {
+                            ingredient.fetch_detached(
+                                zalsa,
+                                crate::database::RawDatabase::from(db),
+                                zalsa_local,
+                                canonical.key_index(),
+                            );
+                        }
+                    }
                     self.refresh_memo(db, zalsa, zalsa_local, id)
                 })) {
                     Ok(memo) => break memo,
                     Err(payload) => {
+                        pending_canonical = None;
                         // GODE: any unwind that reaches the top level while this thread
                         // owns a live cycle group means the group's evaluation died
                         // (panic, propagated panic, or a back-out). Discard its
@@ -60,6 +82,14 @@ where
                                 zalsa_local.end_cycle_backout();
                                 // Give the winning thread time to finalize the cycle.
                                 std::thread::yield_now();
+                                continue;
+                            }
+                            Cancelled::CycleCanonicalize { canonical } => {
+                                crate::tracing::debug!(
+                                    "{database_key_index:?}: canonical cycle re-evaluation from {canonical:?}"
+                                );
+                                zalsa_local.end_cycle_backout();
+                                pending_canonical = Some(canonical);
                                 continue;
                             }
                             other => other.throw(),

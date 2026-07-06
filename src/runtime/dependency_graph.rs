@@ -73,9 +73,7 @@ impl DependencyGraph {
         _contested_key: DatabaseKeyIndex,
         my_root: Option<DatabaseKeyIndex>,
     ) -> Option<DatabaseKeyIndex> {
-        fn order(key: DatabaseKeyIndex) -> (u32, u64) {
-            (key.ingredient_index().as_u32(), key.key_index().as_bits())
-        }
+        use crate::runtime::cycle_groups::key_order as order;
 
         let blocked_key_of = |thread: ThreadId| -> Option<DatabaseKeyIndex> {
             self.query_dependents

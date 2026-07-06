@@ -178,6 +178,12 @@ pub(crate) mod cycle_groups {
         pub(crate) owner: ThreadId,
     }
 
+    /// An arbitrary but run-stable total order over query keys, used to pick canonical
+    /// cycle-group entries and to arbitrate group-vs-group conflicts.
+    pub(crate) fn key_order(key: DatabaseKeyIndex) -> (u32, u64) {
+        (key.ingredient_index().as_u32(), key.key_index().as_bits())
+    }
+
     impl Default for CycleGroups {
         fn default() -> Self {
             Self {

@@ -315,7 +315,9 @@ fn two_mixed_panic() {
 /// +-----------------+
 ///
 /// Two-query cycle, both with iteration.
-/// We converge on the initial value of whichever we first enter from.
+/// Canonicalization re-evaluates the cycle from its minimum member, so we converge on
+/// that member's initial value regardless of which query we enter from (here the
+/// max-iterate query is canonical, as in the sibling test below).
 #[test]
 fn two_iterate_converge_initial_value() {
     let mut db = DbImpl::new();
@@ -326,8 +328,8 @@ fn two_iterate_converge_initial_value() {
     a_in.set_inputs(&mut db).to(vec![b.clone()]);
     b_in.set_inputs(&mut db).to(vec![a.clone()]);
 
-    a.assert_value(&db, 255);
-    b.assert_value(&db, 255);
+    a.assert_value(&db, 0);
+    b.assert_value(&db, 0);
 }
 
 /// a:Xi(b) --> b:Ni(a)
@@ -335,7 +337,8 @@ fn two_iterate_converge_initial_value() {
 /// +-----------------+
 ///
 /// Two-query cycle, both with iteration.
-/// We converge on the initial value of whichever we enter from.
+/// The canonical (minimum-key) member is the entry here, so no re-evaluation happens
+/// and we converge on its initial value directly.
 /// (Same setup as above test, different query order.)
 #[test]
 fn two_iterate_converge_initial_value_2() {

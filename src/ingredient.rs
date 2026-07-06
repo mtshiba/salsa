@@ -77,6 +77,23 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         );
     }
 
+    /// Forces evaluation of `key` on the current (empty) query stack. Used for the
+    /// detached canonical re-evaluation of a cycle group (GODE I-D); only function
+    /// ingredients can be cycle-group members.
+    ///
+    /// # Safety
+    ///
+    /// The `db` must belong to the same database as this ingredient.
+    unsafe fn fetch_detached(
+        &self,
+        _zalsa: &Zalsa,
+        _db: crate::database::RawDatabase<'_>,
+        _zalsa_local: &crate::zalsa_local::ZalsaLocal,
+        _key: Id,
+    ) {
+        unreachable!("fetch_detached called on an ingredient that cannot be a cycle member")
+    }
+
     /// Returns information about the current provisional status of `input`.
     ///
     /// Is it a provisional value or has it been finalized and in which iteration.

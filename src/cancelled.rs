@@ -24,6 +24,16 @@ pub enum Cancelled {
     /// backs out entirely (releasing all of its claims) and retries from the top level once
     /// the winning thread has finalized the cycle.
     CycleLoser,
+
+    /// A cycle group converged, but this evaluation did not enter the strongly connected
+    /// component at its canonical (minimum) member, so the converged values could depend
+    /// on which query happened to close the cycle first. The owner backs out, the group's
+    /// provisional state is discarded, and the component is re-evaluated detached from
+    /// `canonical`.
+    CycleCanonicalize {
+        /// The canonical entry: the group's minimum member key.
+        canonical: crate::key::DatabaseKeyIndex,
+    },
 }
 
 impl Cancelled {
@@ -56,6 +66,7 @@ impl std::fmt::Display for Cancelled {
             Cancelled::PendingWrite => "pending write",
             Cancelled::PropagatedPanic => "propagated panic",
             Cancelled::CycleLoser => "losing a cross-thread cycle race",
+            Cancelled::CycleCanonicalize { .. } => "canonical cycle re-evaluation",
         };
         f.write_str("cancelled because of ")?;
         f.write_str(why)

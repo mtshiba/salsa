@@ -314,7 +314,46 @@ where
                     if outer_cycle.is_none() {
                         let zalsa_local = claim_guard.zalsa_local();
                         if let Some(root) = zalsa_local.current_cycle_group() {
-                            zalsa.runtime().cycle_groups().complete(root);
+                            let groups = zalsa.runtime().cycle_groups();
+                            // I-D: converged values must come from an evaluation that
+                            // entered the component at its minimum member; otherwise
+                            // they can depend on which query closed the cycle first.
+                            // Single-member groups are trivially canonical. Discard a
+                            // non-canonical evaluation and redo it detached from the
+                            // canonical entry (see the top-level catch in `fetch`).
+                            let members = groups.members_of(root);
+                            let canonical = members
+                                .iter()
+                                .copied()
+                                .min_by_key(|&key| crate::runtime::cycle_groups::key_order(key))
+                                .unwrap_or(root);
+                            // The entry is the deepest query-stack frame that belongs to
+                            // the group: every on-stack member was hit by a back edge, so
+                            // the member ledger covers them all. The converging head's own
+                            // frame was already popped by `try_complete_cycle_head`, so if
+                            // no member is left on the stack the head itself is the entry.
+                            let is_canonical = members.len() <= 1 || {
+                                let member_set = members
+                                    .iter()
+                                    .copied()
+                                    .collect::<crate::hash::FxHashSet<_>>();
+                                // SAFETY: The stack is not accessed reentrantly.
+                                let entry = unsafe {
+                                    zalsa_local.with_query_stack_unchecked(|stack| {
+                                        stack
+                                            .iter()
+                                            .map(|query| query.database_key_index)
+                                            .find(|key| member_set.contains(key))
+                                    })
+                                }
+                                .unwrap_or(database_key_index);
+                                entry == canonical
+                            };
+                            if !is_canonical {
+                                zalsa_local.begin_cycle_backout();
+                                Cancelled::CycleCanonicalize { canonical }.throw()
+                            }
+                            groups.complete(root);
                             zalsa_local.set_current_cycle_group(None);
                         }
                     }
@@ -522,13 +561,13 @@ fn try_complete_query<'db>(
 }
 
 #[must_use]
-struct DisableLocalCancellationGuard<'a> {
+pub(super) struct DisableLocalCancellationGuard<'a> {
     zalsa_local: &'a ZalsaLocal,
     was_disabled: bool,
 }
 
 impl<'a> DisableLocalCancellationGuard<'a> {
-    fn new(zalsa_local: &'a ZalsaLocal) -> Self {
+    pub(super) fn new(zalsa_local: &'a ZalsaLocal) -> Self {
         Self {
             zalsa_local,
             was_disabled: zalsa_local.set_cancellation_disabled(true),

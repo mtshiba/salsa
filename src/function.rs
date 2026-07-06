@@ -356,6 +356,18 @@ where
         self.remove_memo_from_table_for(zalsa, input, memo_ingredient_index);
     }
 
+    unsafe fn fetch_detached(
+        &self,
+        zalsa: &Zalsa,
+        db: crate::database::RawDatabase<'_>,
+        zalsa_local: &crate::zalsa_local::ZalsaLocal,
+        key: Id,
+    ) {
+        // SAFETY: The `db` belongs to the ingredient as per caller invariant.
+        let db = unsafe { self.view_caster().downcast_unchecked(db) };
+        self.fetch(db, zalsa, zalsa_local, key);
+    }
+
     fn provisional_status<'db>(
         &self,
         zalsa: &'db Zalsa,
