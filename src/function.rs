@@ -351,6 +351,11 @@ where
     ///
     /// Otherwise, the value is still provisional. For both final and provisional, it also
     /// returns the iteration in which this memo was created (always 0 except for cycle heads).
+    fn remove_memo(&self, zalsa: &Zalsa, input: Id) {
+        let memo_ingredient_index = self.memo_ingredient_index(zalsa, input);
+        self.remove_memo_from_table_for(zalsa, input, memo_ingredient_index);
+    }
+
     fn provisional_status<'db>(
         &self,
         zalsa: &'db Zalsa,

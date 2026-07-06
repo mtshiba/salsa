@@ -68,6 +68,15 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         visited_edges: &mut FxHashSet<QueryEdge>,
     );
 
+    /// Removes the memo for `input`, leaving the query in the never-computed state. The
+    /// old allocation stays alive until the end of the revision. Used to discard the
+    /// provisional state of an aborted or panicked cycle group (GODE).
+    fn remove_memo(&self, _zalsa: &Zalsa, _input: Id) {
+        unreachable!(
+            "remove_memo should only be called on cycle group members and only functions can participate in cycles"
+        );
+    }
+
     /// Returns information about the current provisional status of `input`.
     ///
     /// Is it a provisional value or has it been finalized and in which iteration.

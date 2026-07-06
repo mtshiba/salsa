@@ -308,6 +308,19 @@ where
                 value_converged,
             ) {
                 Ok(completed_query) => {
+                    // GODE: the outermost cycle head converged; the group's provisional
+                    // state becomes final through the normal machinery, so complete the
+                    // group and wake the threads parked on it.
+                    if outer_cycle.is_none() {
+                        let zalsa_local = claim_guard.zalsa_local();
+                        if let Some(root) = zalsa_local.current_cycle_group() {
+                            zalsa.runtime().cycle_groups().complete(
+                                root,
+                                crate::runtime::cycle_groups::GroupOutcome::Finalized,
+                            );
+                            zalsa_local.set_current_cycle_group(None);
+                        }
+                    }
                     break (new_value, completed_query);
                 }
                 Err((completed_query, new_iteration)) => {
@@ -779,6 +792,15 @@ fn complete_cycle_participant(
     // which would result in them competing for the same locks (we want the locks to converge to a single cycle head).
     claim_guard.set_release_mode(ReleaseMode::TransferTo(outer_cycle));
     let zalsa = claim_guard.zalsa();
+
+    // GODE: record this query as a member of the thread's current cycle group so an
+    // aborted evaluation can discard its provisional memo.
+    if let Some(root) = claim_guard.zalsa_local().current_cycle_group() {
+        zalsa
+            .runtime()
+            .cycle_groups()
+            .add_member(root, active_query.database_key_index);
+    }
 
     let database_key_index = active_query.database_key_index;
     let iteration = iteration.increment_iteration().unwrap_or_else(|| {

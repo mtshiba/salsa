@@ -35,7 +35,31 @@ where
                     self.refresh_memo(db, zalsa, zalsa_local, id)
                 })) {
                     Ok(memo) => break memo,
-                    Err(payload) => match payload.downcast::<Cancelled>() {
+                    Err(payload) => {
+                        // GODE: any unwind that reaches the top level while this thread
+                        // owns a live cycle group means the group's evaluation died
+                        // (panic, propagated panic, or a back-out). Discard its
+                        // provisional state wholesale: remove every member memo (leaving
+                        // the never-computed state) and wake parked threads.
+                        if let Some(root) = zalsa_local.current_cycle_group() {
+                            let groups = zalsa.runtime().cycle_groups();
+                            let is_panic = payload.downcast_ref::<Cancelled>().is_none();
+                            for member in groups.members_of(root) {
+                                zalsa
+                                    .lookup_ingredient(member.ingredient_index())
+                                    .remove_memo(zalsa, member.key_index());
+                            }
+                            groups.complete(
+                                root,
+                                if is_panic {
+                                    crate::runtime::cycle_groups::GroupOutcome::Panicked
+                                } else {
+                                    crate::runtime::cycle_groups::GroupOutcome::Aborted
+                                },
+                            );
+                            zalsa_local.set_current_cycle_group(None);
+                        }
+                        match payload.downcast::<Cancelled>() {
                         Ok(cancelled) => match *cancelled {
                             Cancelled::CycleLoser => {
                                 crate::tracing::debug!(
@@ -49,7 +73,8 @@ where
                             other => other.throw(),
                         },
                         Err(payload) => std::panic::resume_unwind(payload),
-                    },
+                    }
+                    }
                 }
             }
         } else {
@@ -196,44 +221,28 @@ where
             }
         };
 
-        // Deterministic fixpoint: never execute or reuse another thread's in-flight
-        // provisional cycle state. If the memo is provisional for cycle heads that are not
-        // on our own query stack and at least one of those heads is itself still
-        // provisional (the cycle is genuinely being iterated, not merely pending lazy
-        // finalization), the owning thread is between iterations; wait for it to finalize
-        // instead of re-executing the participant (which would make this thread a
-        // concurrent co-iterator of the cycle).
+        // GODE: never execute or reuse another thread's in-flight provisional cycle
+        // state. Every provisional memo belongs to a registered cycle group; if that
+        // group is live and owned by another thread, park on the group until it
+        // finalizes (or aborts) and then retry. A provisional memo without a live group
+        // is a leftover of a real panic and falls through to normal (failing)
+        // verification and re-execution.
         if let Some(old_memo) = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index) {
-            if old_memo.value.is_some()
-                && old_memo.header.may_be_provisional()
+            if old_memo.header.may_be_provisional()
                 && old_memo.header.verified_at.load() == zalsa.current_revision()
+                && !old_memo.header.cycle_heads().is_empty()
             {
-                let heads = old_memo.header.cycle_heads();
-                if !heads.is_empty()
-                    && !zalsa_local.query_stack_contains_any(heads)
-                    && heads.iter().any(|head| {
-                        let head_ingredient = zalsa
-                            .lookup_ingredient(head.database_key_index.ingredient_index());
-                        // A *live* cycle keeps its head claimed for the entire iteration
-                        // (the driving thread holds the head's claim guard across all
-                        // iterations), so park only while the head runs on *another*
-                        // thread. An unclaimed provisional head is an abandoned leftover
-                        // that will never finalize, and a head claimed by the current
-                        // thread (e.g. while verifying without a query frame) must not
-                        // park us against ourselves; fall through and re-execute then.
-                        matches!(
-                            head_ingredient
-                                .provisional_status(zalsa, head.database_key_index.key_index()),
-                            Some(crate::cycle::ProvisionalStatus::Provisional { .. })
-                        ) && matches!(
-                            head_ingredient.wait_for(zalsa, head.database_key_index.key_index()),
-                            crate::function::WaitForResult::Running(_)
-                        )
-                    })
-                {
-                    drop(claim_guard);
-                    std::thread::yield_now();
-                    return None;
+                if let Some(group) = zalsa.runtime().cycle_groups().group_of(database_key_index) {
+                    if group.owner != crate::sync::thread::current().id() {
+                        drop(claim_guard);
+                        match group.park() {
+                            crate::runtime::cycle_groups::GroupOutcome::Finalized
+                            | crate::runtime::cycle_groups::GroupOutcome::Aborted => return None,
+                            crate::runtime::cycle_groups::GroupOutcome::Panicked => {
+                                Cancelled::PropagatedPanic.throw()
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -280,6 +289,36 @@ where
                 })
             },
             CycleRecoveryStrategy::Fixpoint | CycleRecoveryStrategy::FallbackImmediate => {
+                // GODE: the first cycle hit on this thread forms a cycle group; nested or
+                // repeated hits during the same evaluation join it. The group records its
+                // members so an aborted or panicked evaluation can be discarded wholesale,
+                // and so other threads can park on the group instead of observing its
+                // provisional state.
+                let group_root = match zalsa_local.current_cycle_group() {
+                    Some(root) => Some(root),
+                    None => {
+                        let registered = zalsa
+                            .runtime()
+                            .cycle_groups()
+                            .register(database_key_index, crate::sync::thread::current().id());
+                        if registered.is_some() {
+                            zalsa_local.set_current_cycle_group(Some(database_key_index));
+                            Some(database_key_index)
+                        } else {
+                            // A live group already covers this key. This should not happen
+                            // while we hold the (same-thread) claim; fall back to legacy
+                            // behavior rather than corrupting the registry.
+                            None
+                        }
+                    }
+                };
+                if let Some(root) = group_root {
+                    zalsa
+                        .runtime()
+                        .cycle_groups()
+                        .add_member(root, database_key_index);
+                }
+
                 let cancellation_count = zalsa.runtime().cancellation_count();
                 // check if there's a provisional value for this query
                 // Note we don't `validate_may_be_provisional` the memo here as we want to reuse an

@@ -462,9 +462,14 @@ impl Iterator for TryClaimCycleHeadsIter<'_> {
                 // participates in the cycle and some other query is blocked on this thread.
                 crate::tracing::trace!("Waiting for {head_database_key:?} results in a cycle");
 
-                let provisional_status = ingredient
-                    .provisional_status(self.zalsa, head_key_index)
-                    .expect("cycle head memo to exist");
+                let Some(provisional_status) =
+                    ingredient.provisional_status(self.zalsa, head_key_index)
+                else {
+                    // The head memo is absent: its cycle group was aborted or panicked
+                    // and the provisional state was removed (GODE). The memo referencing
+                    // it cannot be validated.
+                    return Some(TryClaimHeadsResult::Available);
+                };
                 let (current_iteration, verified_at) = match provisional_status {
                     ProvisionalStatus::Provisional {
                         iteration,
