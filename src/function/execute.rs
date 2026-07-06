@@ -385,12 +385,6 @@ where
                                 })
                             }
                             .unwrap_or(database_key_index);
-                            if std::env::var("GODE_DEBUG").is_ok() {
-                                eprintln!(
-                                    "[gode] {} head={database_key_index:?} entry={entry:?} canonical={canonical:?}",
-                                    if entry == canonical { "accept" } else { "restart" },
-                                );
-                            }
                             if entry != canonical {
                                 zalsa_local.begin_cycle_backout();
                                 Cancelled::CycleCanonicalize { canonical }.throw()

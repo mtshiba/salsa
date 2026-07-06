@@ -244,14 +244,6 @@ pub(crate) mod cycle_groups {
             head: DatabaseKeyIndex,
         ) -> Vec<DatabaseKeyIndex> {
             let state = self.state.lock();
-            if std::env::var("GODE_DEBUG").is_ok() {
-                let ledger: Vec<_> = state
-                    .member_heads
-                    .iter()
-                    .filter(|(m, _)| state.member_index.get(m) == Some(&root))
-                    .collect();
-                eprintln!("[ledger] root={root:?} head={head:?} {ledger:?}");
-            }
             let mut component = vec![head];
             let mut frontier = vec![head];
             while let Some(current) = frontier.pop() {
