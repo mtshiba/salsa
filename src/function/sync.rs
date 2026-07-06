@@ -37,6 +37,11 @@ pub(crate) enum ClaimResult<'a, Guard = ClaimGuard<'a>> {
         /// in that case the claimer must not join the cycle if deterministic execution is
         /// desired, see `Cancelled::CycleLoser`.
         same_thread: bool,
+        /// For a cross-thread cycle: `Some(key)` if the current thread won the
+        /// deterministic race (see `DependencyGraph::cross_cycle_decision`) and should
+        /// wake `key`'s waiters with `WaitResult::BackOut` before retrying; `None` if it
+        /// lost and must back out itself.
+        winner_wake: Option<crate::key::DatabaseKeyIndex>,
     },
 }
 
@@ -92,7 +97,7 @@ impl SyncTable {
                         ) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
-                                BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                                BlockResult::Cycle { same_thread, winner_wake } => ClaimResult::Cycle { inner: false, same_thread, winner_wake },
                                 BlockResult::Running(running) => ClaimResult::Running(running),
                             },
                         };
@@ -114,7 +119,7 @@ impl SyncTable {
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
-                    BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                    BlockResult::Cycle { same_thread, winner_wake } => ClaimResult::Cycle { inner: false, same_thread, winner_wake },
                 }
             }
             std::collections::hash_map::Entry::Vacant(vacant_entry) => {
@@ -151,7 +156,7 @@ impl SyncTable {
                         return match self.peek_claim_transferred(zalsa, occupied_entry, reentrant) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
-                                BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                                BlockResult::Cycle { same_thread, winner_wake } => ClaimResult::Cycle { inner: false, same_thread, winner_wake },
                                 BlockResult::Running(running) => ClaimResult::Running(running),
                             },
                         };
@@ -173,7 +178,7 @@ impl SyncTable {
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
-                    BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                    BlockResult::Cycle { same_thread, winner_wake } => ClaimResult::Cycle { inner: false, same_thread, winner_wake },
                 }
             }
             std::collections::hash_map::Entry::Vacant(_) => ClaimResult::Claimed(()),
@@ -214,7 +219,7 @@ impl SyncTable {
                     mode: ReleaseMode::SelfOnly,
                 }))
             }
-            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true }),
+            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true, winner_wake: None }),
             BlockTransferredResult::OwnedBy(other_thread) => {
                 entry.get_mut().anyone_waiting = true;
                 Err(other_thread)
@@ -256,7 +261,7 @@ impl SyncTable {
             BlockTransferredResult::ImTheOwner if reentrant.is_allow() => {
                 Ok(ClaimResult::Claimed(()))
             }
-            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true }),
+            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true, winner_wake: None }),
             BlockTransferredResult::OwnedBy(other_thread) => {
                 entry.get_mut().anyone_waiting = true;
                 Err(other_thread)

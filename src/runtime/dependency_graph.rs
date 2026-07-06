@@ -50,6 +50,58 @@ impl DependencyGraph {
         self.edges.depends_on(from_id, to_id)
     }
 
+    /// Decides, deterministically, which side of a cross-thread cycle must back out.
+    ///
+    /// The current thread `me` wants to block on `contested_key` (computed by `owner`),
+    /// which would close a cycle `owner -> ... -> me` of blocked threads. The winner is
+    /// the thread computing the smallest key on that cycle: this choice is independent of
+    /// the order in which the threads arrived, so repeated encounters of the same
+    /// conflict always resolve the same way (no back-out ping-pong).
+    ///
+    /// Returns `Some(key)` if `me` wins, where `key` is the key on the cycle that `me`
+    /// itself is computing; the caller must wake `key`'s waiters with
+    /// [`WaitResult::BackOut`] and retry the claim. Returns `None` if `me` loses (or the
+    /// chain cannot be walked, in which case losing is the safe default) and must back
+    /// out itself.
+    pub(super) fn cross_cycle_decision(
+        &self,
+        me: ThreadId,
+        owner: ThreadId,
+        contested_key: DatabaseKeyIndex,
+    ) -> Option<DatabaseKeyIndex> {
+        fn order(key: DatabaseKeyIndex) -> (u32, u64) {
+            (key.ingredient_index().as_u32(), key.key_index().as_bits())
+        }
+
+        let blocked_key_of = |thread: ThreadId| -> Option<DatabaseKeyIndex> {
+            self.query_dependents
+                .iter()
+                .find_map(|(key, dependents)| dependents.contains(&thread).then_some(*key))
+        };
+
+        // `contested_key` is computed by `owner`, never by `me`.
+        let mut min_key = contested_key;
+        let mut min_is_mine = false;
+        let mut wake_key = None;
+
+        let mut current = owner;
+        while current != me {
+            let edge = self.edges.0.get(&current)?;
+            let key = blocked_key_of(current)?;
+            let key_owner = edge.blocked_on_id;
+            if order(key) < order(min_key) {
+                min_key = key;
+                min_is_mine = key_owner == me;
+            }
+            if key_owner == me {
+                wake_key = Some(key);
+            }
+            current = key_owner;
+        }
+
+        if min_is_mine { wake_key } else { None }
+    }
+
     /// Modifies the graph so that `from_id` is blocked
     /// on `database_key`, which is being computed by
     /// `to_id`.

@@ -359,6 +359,20 @@ where
         let memo =
             self.get_memo_from_table_for(zalsa, input, self.memo_ingredient_index(zalsa, input))?;
 
+        // A value-less `verified_final` memo is a cancellation/back-out tombstone (see
+        // `PoisonProvisionalIfPanicking`): report it as absent so that no validation path
+        // treats it as a usable head state. Reporting it as `Final` would incorrectly
+        // bless dependents whose recorded head stamp happens to equal the initial stamp.
+        if memo.value.is_none()
+            && memo
+                .header
+                .revisions
+                .verified_final
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+
         Some(memo.header.provisional_status())
     }
 

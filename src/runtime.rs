@@ -50,6 +50,10 @@ pub(super) enum WaitResult {
     Completed,
     Panicked,
     Cancelled,
+    /// The blocked thread must back out of its entire computation (releasing all of its
+    /// claims) and retry from the top level: it is part of a cross-thread cycle whose
+    /// deterministic winner requested the chain to yield. See `Cancelled::CycleLoser`.
+    BackOut,
 }
 
 #[derive(Debug)]
@@ -64,8 +68,15 @@ pub(crate) enum BlockResult<'me> {
     ///
     /// `same_thread` is `true` when the lock is held by the current thread itself (an
     /// intra-thread cycle over the query stack). `false` means the cycle spans threads:
-    /// another thread transitively waits on us.
-    Cycle { same_thread: bool },
+    /// another thread transitively waits on us. In the cross-thread case the winner is
+    /// chosen deterministically (the side holding the smallest key on the deadlock
+    /// cycle): `winner_wake` is `Some(key)` if the current thread won and should wake the
+    /// waiters of `key` (one of its own held keys) with `WaitResult::BackOut`, then retry
+    /// the claim; `None` means the current thread lost and must back out itself.
+    Cycle {
+        same_thread: bool,
+        winner_wake: Option<DatabaseKeyIndex>,
+    },
 }
 
 pub(crate) enum BlockTransferredResult<'me> {
@@ -96,7 +107,10 @@ impl<'me> BlockOnTransferredOwner<'me> {
     pub(super) fn block(self, query_mutex_guard: SyncGuard<'me>) -> BlockResult<'me> {
         // Cycle in the same thread.
         if self.thread_id == self.other_id {
-            return BlockResult::Cycle { same_thread: true };
+            return BlockResult::Cycle {
+                same_thread: true,
+                winner_wake: None,
+            };
         }
 
         if self.dg.depends_on(self.other_id, self.thread_id) {
@@ -106,7 +120,14 @@ impl<'me> BlockOnTransferredOwner<'me> {
                 self.other_id,
                 thread_id = self.thread_id
             );
-            return BlockResult::Cycle { same_thread: false };
+            return BlockResult::Cycle {
+                same_thread: false,
+                winner_wake: self.dg.cross_cycle_decision(
+                    self.thread_id,
+                    self.other_id,
+                    self.database_key,
+                ),
+            };
         }
 
         BlockResult::Running(Running(Box::new(BlockedOnInner {
@@ -129,16 +150,26 @@ struct BlockedOnInner<'me> {
     thread_id: ThreadId,
 }
 
+/// The outcome of blocking on another thread's computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockOutcome {
+    /// The other thread completed the computation.
+    Completed,
+    /// The other thread was cancelled; retry the claim.
+    Cancelled,
+    /// The current thread must back out of its computation entirely (see
+    /// `WaitResult::BackOut`).
+    BackOut,
+}
+
 impl Running<'_> {
     /// Blocks on the other thread to complete the computation.
-    ///
-    /// Returns `true` if the computation was successful, and `false` if the other thread was locally cancelled.
     ///
     /// # Panics
     ///
     /// If the other thread panics, this function will panic as well.
     #[must_use]
-    pub(crate) fn block_on(self, zalsa: &Zalsa) -> bool {
+    pub(crate) fn block_on(self, zalsa: &Zalsa) -> BlockOutcome {
         let BlockedOnInner {
             dg,
             query_mutex_guard,
@@ -168,8 +199,9 @@ impl Running<'_> {
                 // by the other thread and responded to appropriately.
                 Cancelled::PropagatedPanic.throw()
             }
-            WaitResult::Cancelled => false,
-            WaitResult::Completed => true,
+            WaitResult::Cancelled => BlockOutcome::Cancelled,
+            WaitResult::Completed => BlockOutcome::Completed,
+            WaitResult::BackOut => BlockOutcome::BackOut,
         }
     }
 }
@@ -326,7 +358,10 @@ impl Runtime {
         let thread_id = thread::current().id();
         // Cycle in the same thread.
         if thread_id == other_id {
-            return BlockResult::Cycle { same_thread: true };
+            return BlockResult::Cycle {
+                same_thread: true,
+                winner_wake: None,
+            };
         }
 
         let dg = self.dependency_graph.lock();
@@ -335,7 +370,10 @@ impl Runtime {
             crate::tracing::debug!(
                 "block_on: cycle detected for {database_key:?} in thread {thread_id:?} on {other_id:?}"
             );
-            return BlockResult::Cycle { same_thread: false };
+            return BlockResult::Cycle {
+                same_thread: false,
+                winner_wake: dg.cross_cycle_decision(thread_id, other_id, database_key),
+            };
         }
 
         BlockResult::Running(Running(Box::new(BlockedOnInner {

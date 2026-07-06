@@ -375,6 +375,18 @@ impl MemoHeader {
             return None;
         }
 
+        // A value-less memo that is marked `verified_final` is a cancellation/back-out
+        // tombstone (see `PoisonProvisionalIfPanicking`), not a panic: restart from a
+        // fresh iteration.
+        if !has_value
+            && self
+                .revisions
+                .verified_final
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+
         // The `DependencyGraph` locking propagates panics when another thread is blocked on a panicking query.
         // However, the locking doesn't handle the case where a thread fetches the result of a panicking
         // cycle head query **after** all locks were released. That's what we do here.
@@ -555,23 +567,31 @@ impl<'a, C: Configuration> PoisonProvisionalIfPanicking<'a, C> {
 impl<C: Configuration> Drop for PoisonProvisionalIfPanicking<'_, C> {
     fn drop(&mut self) {
         if thread::panicking() {
+            let mut revisions = QueryRevisions::fixpoint_initial(
+                self.ingredient.database_key_index(self.id),
+                IterationStamp::initial(self.zalsa.runtime().cancellation_count()),
+            );
+
             // A cancellation unwind (including a cross-thread cycle-race back-out, see
             // `Cancelled::CycleLoser`) is not a real panic: the query must simply be
-            // re-executed later. Stamp the placeholder with a mismatched cancellation
-            // count so every reader treats it as stale and re-executes, instead of
-            // propagating a panic via `previous_iteration`.
-            let cancellation_count = self.zalsa.runtime().cancellation_count();
-            let cancellation_count = if self.zalsa_local.should_trigger_local_cancellation()
+            // re-executed later. Mark the placeholder as a tombstone with the otherwise
+            // impossible combination "no value + verified_final": `previous_iteration`
+            // then restarts from a fresh iteration instead of propagating a panic, and
+            // `provisional_status` reports `Final` with the initial stamp, which fails
+            // the head-iteration comparison in `validate_provisional` so dependents
+            // re-execute instead of reusing state derived from the backed-out run.
+            if self.zalsa_local.should_trigger_local_cancellation()
                 || self.zalsa_local.is_cycle_backout()
             {
-                cancellation_count.wrapping_sub(1)
-            } else {
-                cancellation_count
-            };
-            let revisions = QueryRevisions::fixpoint_initial(
-                self.ingredient.database_key_index(self.id),
-                IterationStamp::initial(cancellation_count),
-            );
+                *revisions.verified_final.get_mut() = true;
+                // `verified_final` memos must not carry cycle heads (see
+                // `MemoHeader::new`); the tombstone is identified by
+                // "no value + verified_final" alone.
+                revisions.set_cycle_heads(
+                    CycleHeads::default(),
+                    IterationStamp::initial(self.zalsa.runtime().cancellation_count()),
+                );
+            }
 
             let memo = Memo::new(None, self.zalsa.current_revision(), revisions);
             self.ingredient

@@ -145,7 +145,9 @@ where
         {
             ClaimResult::Claimed(guard) => guard,
             ClaimResult::Running(blocked_on) => {
-                let _ = blocked_on.block_on(zalsa);
+                if blocked_on.block_on(zalsa) == crate::runtime::BlockOutcome::BackOut {
+                    cycle_loser_unwind(zalsa_local, database_key_index)
+                }
                 return None;
             }
             ClaimResult::Cycle { same_thread: true, .. } => {
@@ -158,11 +160,32 @@ where
                     memo_ingredient_index,
                 ));
             }
-            ClaimResult::Cycle { same_thread: false, .. } => {
+            ClaimResult::Cycle {
+                same_thread: false,
+                winner_wake: Some(wake_key),
+                ..
+            } => {
+                // Cross-thread cycle, and we hold the smallest key on it: the other side
+                // must yield. Wake the waiters of our key with `BackOut` (they unwind and
+                // retry from their top level) and retry the claim.
+                crate::tracing::debug!(
+                    "{database_key_index:?}: cross-thread cycle detected; winning side wakes {wake_key:?}"
+                );
+                zalsa
+                    .runtime()
+                    .unblock_queries_blocked_on(wake_key, crate::runtime::WaitResult::BackOut);
+                std::thread::yield_now();
+                return None;
+            }
+            ClaimResult::Cycle {
+                same_thread: false,
+                winner_wake: None,
+                ..
+            } => {
                 // Joining a cross-thread cycle would let two threads iterate one strongly
                 // connected component concurrently, making the fixpoint trace (and with
                 // non-monotone recovery functions, the converged values) depend on thread
-                // scheduling. Back out entirely instead; the other thread completes the
+                // scheduling. Back out entirely instead; the winning thread completes the
                 // cycle alone and we retry from the top level.
                 cycle_loser_unwind(zalsa_local, database_key_index)
             }
@@ -320,7 +343,7 @@ where
 /// `WaitResult::Panicked` (waiters propagate the panic).
 #[cold]
 #[inline(never)]
-fn cycle_loser_unwind(zalsa_local: &ZalsaLocal, database_key_index: DatabaseKeyIndex) -> ! {
+pub(super) fn cycle_loser_unwind(zalsa_local: &ZalsaLocal, database_key_index: DatabaseKeyIndex) -> ! {
     crate::tracing::debug!(
         "{database_key_index:?}: cross-thread cycle detected; unwinding as the losing side"
     );

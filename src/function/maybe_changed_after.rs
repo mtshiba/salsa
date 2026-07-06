@@ -151,9 +151,29 @@ where
             {
                 ClaimResult::Claimed(guard) => guard,
                 ClaimResult::Running(blocked_on) => {
-                    let _ = blocked_on.block_on(zalsa);
+                    if blocked_on.block_on(zalsa) == crate::runtime::BlockOutcome::BackOut {
+                        crate::function::fetch::cycle_loser_unwind(zalsa_local, database_key_index)
+                    }
                     return None;
                 }
+                ClaimResult::Cycle {
+                    same_thread: false,
+                    winner_wake: Some(wake_key),
+                    ..
+                } => {
+                    // See the corresponding arm in `fetch_cold`: we won the deterministic
+                    // cross-thread cycle race, wake the losing chain and retry.
+                    zalsa
+                        .runtime()
+                        .unblock_queries_blocked_on(wake_key, crate::runtime::WaitResult::BackOut);
+                    std::thread::yield_now();
+                    return None;
+                }
+                ClaimResult::Cycle {
+                    same_thread: false,
+                    winner_wake: None,
+                    ..
+                } => crate::function::fetch::cycle_loser_unwind(zalsa_local, database_key_index),
                 ClaimResult::Cycle { .. } => {
                     return Some(maybe_changed_after_cold_cycle(
                         zalsa_local,
