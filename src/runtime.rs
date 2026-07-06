@@ -24,6 +24,9 @@ pub struct Runtime {
     #[cfg_attr(feature = "persistence", serde(skip))]
     cancellation_count: AtomicU8,
 
+    /// In-flight cycle groups (GODE), see [`cycle_groups::CycleGroups`].
+    cycle_groups: cycle_groups::CycleGroups,
+
     /// Stores the "last change" revision for values of each duration.
     /// This vector is always of length at least 1 (for Durability 0)
     /// but its total length depends on the number of durations. The
@@ -140,6 +143,142 @@ struct BlockedOnInner<'me> {
     thread_id: ThreadId,
 }
 
+/// Registry of in-flight cycle groups (GODE: Group-Owned Detached Evaluation).
+///
+/// A cycle group is created when a thread closes a dependency cycle; that thread backs
+/// out to its top level and re-evaluates the strongly connected component *detached*
+/// (with an empty query stack), as the group's single owner. Every other thread that
+/// touches the group's provisional state parks here until the group completes. The group
+/// records its members so that an aborted evaluation can be discarded wholesale by
+/// removing the members' memos (leaving no observable leftovers).
+pub(crate) mod cycle_groups {
+    use rustc_hash::FxHashMap;
+
+    use crate::key::DatabaseKeyIndex;
+    use crate::sync::thread::ThreadId;
+    use crate::sync::{Arc, Condvar, Mutex};
+
+    pub(crate) struct CycleGroups {
+        state: Mutex<GroupsState>,
+    }
+
+    #[derive(Default)]
+    struct GroupsState {
+        /// Live groups by root key.
+        groups: FxHashMap<DatabaseKeyIndex, Arc<GroupState>>,
+        /// Member key -> root key of the live group it belongs to.
+        member_index: FxHashMap<DatabaseKeyIndex, DatabaseKeyIndex>,
+    }
+
+    pub(crate) struct GroupState {
+        pub(crate) root: DatabaseKeyIndex,
+        pub(crate) owner: ThreadId,
+        phase: Mutex<GroupPhase>,
+        cv: Condvar,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum GroupPhase {
+        Running,
+        Done(GroupOutcome),
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum GroupOutcome {
+        /// The group converged; all member memos are finalized in the table.
+        Finalized,
+        /// The group was aborted (e.g. lost a group-vs-group conflict); all member memos
+        /// were removed. Parked threads retry.
+        Aborted,
+        /// The group's evaluation panicked; parked threads propagate the panic.
+        Panicked,
+    }
+
+    impl Default for CycleGroups {
+        fn default() -> Self {
+            Self {
+                state: Mutex::new(GroupsState::default()),
+            }
+        }
+    }
+
+    impl CycleGroups {
+        /// Registers a new group rooted at `root`, owned by the current thread. Returns
+        /// `None` if a live group already covers `root` (as root or member).
+        pub(crate) fn register(
+            &self,
+            root: DatabaseKeyIndex,
+            owner: ThreadId,
+        ) -> Option<Arc<GroupState>> {
+            let mut state = self.state.lock();
+            if state.groups.contains_key(&root) || state.member_index.contains_key(&root) {
+                return None;
+            }
+            let group = Arc::new(GroupState {
+                root,
+                owner,
+                phase: Mutex::new(GroupPhase::Running),
+                cv: Condvar::default(),
+            });
+            state.groups.insert(root, Arc::clone(&group));
+            state.member_index.insert(root, root);
+            Some(group)
+        }
+
+        /// Records `member` as part of the live group rooted at `root`.
+        pub(crate) fn add_member(&self, root: DatabaseKeyIndex, member: DatabaseKeyIndex) {
+            let mut state = self.state.lock();
+            debug_assert!(state.groups.contains_key(&root));
+            state.member_index.insert(member, root);
+        }
+
+        /// The live group that `key` belongs to, if any.
+        pub(crate) fn group_of(&self, key: DatabaseKeyIndex) -> Option<Arc<GroupState>> {
+            let state = self.state.lock();
+            let root = state.member_index.get(&key)?;
+            state.groups.get(root).cloned()
+        }
+
+        /// The members of the live group rooted at `root` (excluding queries that were
+        /// never recorded).
+        pub(crate) fn members_of(&self, root: DatabaseKeyIndex) -> Vec<DatabaseKeyIndex> {
+            let state = self.state.lock();
+            state
+                .member_index
+                .iter()
+                .filter_map(|(member, r)| (*r == root).then_some(*member))
+                .collect()
+        }
+
+        /// Completes the group rooted at `root`: removes it from the registry and wakes
+        /// every parked thread with `outcome`.
+        pub(crate) fn complete(&self, root: DatabaseKeyIndex, outcome: GroupOutcome) {
+            let group = {
+                let mut state = self.state.lock();
+                state.member_index.retain(|_, r| *r != root);
+                state.groups.remove(&root)
+            };
+            if let Some(group) = group {
+                *group.phase.lock() = GroupPhase::Done(outcome);
+                group.cv.notify_all();
+            }
+        }
+    }
+
+    impl GroupState {
+        /// Parks the current thread until the group completes.
+        pub(crate) fn park(&self) -> GroupOutcome {
+            let mut phase = self.phase.lock();
+            loop {
+                match *phase {
+                    GroupPhase::Done(outcome) => return outcome,
+                    GroupPhase::Running => phase = self.cv.wait(phase),
+                }
+            }
+        }
+    }
+}
+
 /// The outcome of blocking on another thread's computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockOutcome {
@@ -225,6 +364,7 @@ impl Default for Runtime {
             revisions: [Revision::start(); Durability::LEN],
             revision_cancelled: Default::default(),
             cancellation_count: Default::default(),
+            cycle_groups: Default::default(),
             dependency_graph: Default::default(),
             table: Default::default(),
         }
@@ -281,6 +421,10 @@ impl Runtime {
 
     pub(crate) fn load_cancellation_flag(&self) -> bool {
         self.revision_cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cycle_groups(&self) -> &cycle_groups::CycleGroups {
+        &self.cycle_groups
     }
 
     pub(crate) fn cancellation_count(&self) -> u8 {

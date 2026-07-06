@@ -53,6 +53,11 @@ pub struct ZalsaLocal {
     /// always release claims as `WaitResult::Cancelled` and must never leave panic-poisoned
     /// provisional memos behind.
     cycle_backout: Cell<bool>,
+
+    /// The root of the cycle group this thread is currently evaluating detached (GODE),
+    /// if any. Set for the whole detached evaluation, so that nested cycle formations
+    /// join the same group instead of creating new ones.
+    current_cycle_group: Cell<Option<DatabaseKeyIndex>>,
 }
 
 /// A cancellation token that can be used to cancel a query computation for a specific local `Database`.
@@ -99,6 +104,7 @@ impl ZalsaLocal {
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             cancelled: CancellationToken::default(),
             cycle_backout: Cell::new(false),
+            current_cycle_group: Cell::new(None),
         }
     }
 
@@ -532,6 +538,16 @@ impl ZalsaLocal {
     #[inline]
     pub(crate) fn is_cycle_backout(&self) -> bool {
         self.cycle_backout.get()
+    }
+
+    #[inline]
+    pub(crate) fn current_cycle_group(&self) -> Option<DatabaseKeyIndex> {
+        self.current_cycle_group.get()
+    }
+
+    #[inline]
+    pub(crate) fn set_current_cycle_group(&self, root: Option<DatabaseKeyIndex>) {
+        self.current_cycle_group.set(root);
     }
 
     #[inline]

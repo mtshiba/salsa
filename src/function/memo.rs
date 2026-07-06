@@ -39,6 +39,28 @@ impl<C: Configuration> IngredientImpl<C> {
         })
     }
 
+    /// Removes the memo for `key_index`, keeping the old allocation alive until the end
+    /// of the revision. Afterwards the query reads as never-computed. Used to discard the
+    /// provisional state of an aborted cycle group wholesale (see `CycleGroups`).
+    pub(super) fn remove_memo_from_table_for<'db>(
+        &'db self,
+        zalsa: &'db Zalsa,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) {
+        if let Some(old_value) = zalsa
+            .memo_table_for::<C::SalsaStruct<'_>>(id)
+            .remove::<Memo<'static, C>>(memo_ingredient_index)
+        {
+            // In case there is a reference to the old memo out there, we have to store it
+            // in the deleted entries. This will get cleared when a new revision starts.
+            //
+            // SAFETY: Once the revision starts, there will be no outstanding borrows to
+            // the memo contents, and so it will be safe to free.
+            unsafe { self.deleted_entries.push(old_value) };
+        }
+    }
+
     /// Loads the current memo for `key_index`. This does not hold any sort of
     /// lock on the `memo_map` once it returns, so this memo could immediately
     /// become outdated if other threads store into the `memo_map`.

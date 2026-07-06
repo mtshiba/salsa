@@ -327,6 +327,37 @@ impl MemoTableWithTypes<'_> {
     }
 
     /// Returns a pointer to the memo at the given index, if one has been inserted.
+    /// Removes the memo for `memo_ingredient_index`, returning it.
+    ///
+    /// Afterwards the entry reads as absent, which every consumer handles like a query
+    /// that was never computed. The caller must keep the returned memo alive for the
+    /// remainder of the revision (push it to `DeletedEntries`) in case references to it
+    /// are still outstanding.
+    pub(crate) fn remove<M: Memo>(
+        self,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> Option<NonNull<M>> {
+        let MemoEntry { atomic_memo } = self.memos.memos.get(memo_ingredient_index.as_usize())?;
+
+        // SAFETY: Any indices that are in-bounds for the `MemoTable` are also in-bounds for its
+        // corresponding `MemoTableTypes`, by construction.
+        let type_ = unsafe {
+            self.types
+                .types
+                .get_unchecked(memo_ingredient_index.as_usize())
+        };
+
+        // Verify that the we are casting to the correct type.
+        if type_.type_id != TypeId::of::<M>() {
+            type_assert_failed(memo_ingredient_index);
+        }
+
+        let old_memo = atomic_memo.swap(std::ptr::null_mut(), Ordering::AcqRel);
+
+        // SAFETY: We asserted that the type is correct above.
+        NonNull::new(old_memo).map(|memo| unsafe { MemoEntryType::from_dummy(memo) })
+    }
+
     #[inline]
     pub(crate) fn get<M: Memo>(
         self,
