@@ -151,7 +151,9 @@ where
             {
                 ClaimResult::Claimed(guard) => guard,
                 ClaimResult::Running(blocked_on) => {
-                    let _ = blocked_on.block_on(zalsa);
+                    if blocked_on.block_on(zalsa) == crate::runtime::BlockOutcome::BackOut {
+                        crate::function::fetch::cycle_loser_unwind(zalsa_local, database_key_index)
+                    }
                     return None;
                 }
                 ClaimResult::Cycle { .. } => {

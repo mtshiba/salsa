@@ -37,6 +37,8 @@ pub(crate) enum ClaimResult<'a, Guard = ClaimGuard<'a>> {
         /// in that case the claimer must not join the cycle if deterministic execution is
         /// desired, see `Cancelled::CycleLoser`.
         same_thread: bool,
+        /// The thread holding the contested key (meaningful for cross-thread cycles).
+        owner: thread::ThreadId,
     },
 }
 
@@ -92,7 +94,7 @@ impl SyncTable {
                         ) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
-                                BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                                BlockResult::Cycle { same_thread, owner } => ClaimResult::Cycle { inner: false, same_thread, owner },
                                 BlockResult::Running(running) => ClaimResult::Running(running),
                             },
                         };
@@ -114,7 +116,7 @@ impl SyncTable {
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
-                    BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                    BlockResult::Cycle { same_thread, owner } => ClaimResult::Cycle { inner: false, same_thread, owner },
                 }
             }
             std::collections::hash_map::Entry::Vacant(vacant_entry) => {
@@ -151,7 +153,7 @@ impl SyncTable {
                         return match self.peek_claim_transferred(zalsa, occupied_entry, reentrant) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
-                                BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                                BlockResult::Cycle { same_thread, owner } => ClaimResult::Cycle { inner: false, same_thread, owner },
                                 BlockResult::Running(running) => ClaimResult::Running(running),
                             },
                         };
@@ -173,7 +175,7 @@ impl SyncTable {
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
-                    BlockResult::Cycle { same_thread } => ClaimResult::Cycle { inner: false, same_thread },
+                    BlockResult::Cycle { same_thread, owner } => ClaimResult::Cycle { inner: false, same_thread, owner },
                 }
             }
             std::collections::hash_map::Entry::Vacant(_) => ClaimResult::Claimed(()),
@@ -214,7 +216,7 @@ impl SyncTable {
                     mode: ReleaseMode::SelfOnly,
                 }))
             }
-            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true }),
+            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true, owner: thread_id }),
             BlockTransferredResult::OwnedBy(other_thread) => {
                 entry.get_mut().anyone_waiting = true;
                 Err(other_thread)
@@ -256,7 +258,7 @@ impl SyncTable {
             BlockTransferredResult::ImTheOwner if reentrant.is_allow() => {
                 Ok(ClaimResult::Claimed(()))
             }
-            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true }),
+            BlockTransferredResult::ImTheOwner => Ok(ClaimResult::Cycle { inner: true, same_thread: true, owner: thread_id }),
             BlockTransferredResult::OwnedBy(other_thread) => {
                 entry.get_mut().anyone_waiting = true;
                 Err(other_thread)

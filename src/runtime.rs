@@ -50,6 +50,10 @@ pub(super) enum WaitResult {
     Completed,
     Panicked,
     Cancelled,
+    /// The blocked thread must back out of its entire computation (releasing all of its
+    /// claims) and retry from the top level: it is part of a cross-thread cycle whose
+    /// winner requested the chain to yield. See `Cancelled::CycleLoser`.
+    BackOut,
 }
 
 #[derive(Debug)]
@@ -64,8 +68,9 @@ pub(crate) enum BlockResult<'me> {
     ///
     /// `same_thread` is `true` when the lock is held by the current thread itself (an
     /// intra-thread cycle over the query stack). `false` means the cycle spans threads:
-    /// another thread transitively waits on us.
-    Cycle { same_thread: bool },
+    /// another thread transitively waits on us; `owner` is the thread holding the
+    /// contested key (used for the driver-priority back-out decision).
+    Cycle { same_thread: bool, owner: ThreadId },
 }
 
 pub(crate) enum BlockTransferredResult<'me> {
@@ -96,7 +101,10 @@ impl<'me> BlockOnTransferredOwner<'me> {
     pub(super) fn block(self, query_mutex_guard: SyncGuard<'me>) -> BlockResult<'me> {
         // Cycle in the same thread.
         if self.thread_id == self.other_id {
-            return BlockResult::Cycle { same_thread: true };
+            return BlockResult::Cycle {
+                same_thread: true,
+                owner: self.other_id,
+            };
         }
 
         if self.dg.depends_on(self.other_id, self.thread_id) {
@@ -106,7 +114,10 @@ impl<'me> BlockOnTransferredOwner<'me> {
                 self.other_id,
                 thread_id = self.thread_id
             );
-            return BlockResult::Cycle { same_thread: false };
+            return BlockResult::Cycle {
+                same_thread: false,
+                owner: self.other_id,
+            };
         }
 
         BlockResult::Running(Running(Box::new(BlockedOnInner {
@@ -129,16 +140,26 @@ struct BlockedOnInner<'me> {
     thread_id: ThreadId,
 }
 
+/// The outcome of blocking on another thread's computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockOutcome {
+    /// The other thread completed the computation.
+    Completed,
+    /// The other thread was cancelled; retry the claim.
+    Cancelled,
+    /// The current thread must back out of its computation entirely (see
+    /// `WaitResult::BackOut`).
+    BackOut,
+}
+
 impl Running<'_> {
     /// Blocks on the other thread to complete the computation.
-    ///
-    /// Returns `true` if the computation was successful, and `false` if the other thread was locally cancelled.
     ///
     /// # Panics
     ///
     /// If the other thread panics, this function will panic as well.
     #[must_use]
-    pub(crate) fn block_on(self, zalsa: &Zalsa) -> bool {
+    pub(crate) fn block_on(self, zalsa: &Zalsa) -> BlockOutcome {
         let BlockedOnInner {
             dg,
             query_mutex_guard,
@@ -168,8 +189,9 @@ impl Running<'_> {
                 // by the other thread and responded to appropriately.
                 Cancelled::PropagatedPanic.throw()
             }
-            WaitResult::Cancelled => false,
-            WaitResult::Completed => true,
+            WaitResult::Cancelled => BlockOutcome::Cancelled,
+            WaitResult::Completed => BlockOutcome::Completed,
+            WaitResult::BackOut => BlockOutcome::BackOut,
         }
     }
 }
@@ -306,6 +328,33 @@ impl Runtime {
         r_new
     }
 
+    /// Decides which side of a cross-thread cycle must back out, preferring to keep the
+    /// established cycle driver alive.
+    ///
+    /// The current thread wants `contested_key` (computed by `owner`), which would close a
+    /// cycle `owner -> ... -> me` of blocked threads. Walk that chain and classify each
+    /// held key: a key whose memo is a current provisional fixpoint state marks its owner
+    /// as a *driver* (mid cycle iteration). The driver wins: with "requester always
+    /// loses", an unrelated thread that merely holds a query the driver's evaluation
+    /// reaches would keep killing the driver, re-forming the cycle over and over (each
+    /// re-formation ratchets the inherited iteration stamp until the iteration cap).
+    ///
+    /// Returns `Some(wake_key)` if the current thread should win: `wake_key` is the key it
+    /// holds on the cycle whose waiters must be woken with [`WaitResult::BackOut`].
+    /// Returns `None` if the current thread must back out itself (also the safe fallback
+    /// whenever the chain cannot be walked, e.g. because it changed concurrently).
+    pub(crate) fn cross_cycle_decision(
+        &self,
+        zalsa: &Zalsa,
+        owner: ThreadId,
+        contested_key: DatabaseKeyIndex,
+        i_am_driving: bool,
+    ) -> Option<DatabaseKeyIndex> {
+        let me = thread::current().id();
+        let dg = self.dependency_graph.lock();
+        dg.cross_cycle_walk(zalsa, me, owner, contested_key, i_am_driving)
+    }
+
     /// Block until `other_id` completes executing `database_key`, or return `BlockResult::Cycle`
     /// immediately in case of a cycle.
     ///
@@ -326,7 +375,10 @@ impl Runtime {
         let thread_id = thread::current().id();
         // Cycle in the same thread.
         if thread_id == other_id {
-            return BlockResult::Cycle { same_thread: true };
+            return BlockResult::Cycle {
+                same_thread: true,
+                owner: other_id,
+            };
         }
 
         let dg = self.dependency_graph.lock();
@@ -335,7 +387,10 @@ impl Runtime {
             crate::tracing::debug!(
                 "block_on: cycle detected for {database_key:?} in thread {thread_id:?} on {other_id:?}"
             );
-            return BlockResult::Cycle { same_thread: false };
+            return BlockResult::Cycle {
+                same_thread: false,
+                owner: other_id,
+            };
         }
 
         BlockResult::Running(Running(Box::new(BlockedOnInner {

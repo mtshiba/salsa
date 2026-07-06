@@ -255,6 +255,26 @@ impl ZalsaLocal {
         unsafe { self.with_query_stack_unchecked(|stack| stack.len() == 0) }
     }
 
+    /// Whether any query on the current thread's stack is currently a live fixpoint
+    /// cycle head (its memo is a current provisional state): the thread is *driving* a
+    /// cycle iteration.
+    pub(crate) fn query_stack_has_live_cycle_head(&self, zalsa: &crate::zalsa::Zalsa) -> bool {
+        // SAFETY: We do not access the query stack reentrantly.
+        unsafe {
+            self.with_query_stack_unchecked(|stack| {
+                stack.iter().any(|active_query| {
+                    let key = active_query.database_key_index;
+                    matches!(
+                        zalsa
+                            .lookup_ingredient(key.ingredient_index())
+                            .provisional_status(zalsa, key.key_index()),
+                        Some(crate::cycle::ProvisionalStatus::Provisional { .. })
+                    )
+                })
+            })
+        }
+    }
+
     /// Whether any query on the current thread's stack is one of the given cycle heads.
     /// Used to distinguish a cycle participant (which may see the cycle's provisional
     /// values) from an unrelated thread (which must wait for the final values).

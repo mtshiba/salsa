@@ -145,7 +145,9 @@ where
         {
             ClaimResult::Claimed(guard) => guard,
             ClaimResult::Running(blocked_on) => {
-                let _ = blocked_on.block_on(zalsa);
+                if blocked_on.block_on(zalsa) == crate::runtime::BlockOutcome::BackOut {
+                    cycle_loser_unwind(zalsa_local, database_key_index)
+                }
                 return None;
             }
             ClaimResult::Cycle { same_thread: true, .. } => {
@@ -158,13 +160,39 @@ where
                     memo_ingredient_index,
                 ));
             }
-            ClaimResult::Cycle { same_thread: false, .. } => {
+            ClaimResult::Cycle {
+                same_thread: false,
+                owner,
+                ..
+            } => {
                 // Joining a cross-thread cycle would let two threads iterate one strongly
                 // connected component concurrently, making the fixpoint trace (and with
                 // non-monotone recovery functions, the converged values) depend on thread
-                // scheduling. Back out entirely instead; the other thread completes the
-                // cycle alone and we retry from the top level.
-                cycle_loser_unwind(zalsa_local, database_key_index)
+                // scheduling. One side must back out entirely and retry from the top
+                // level. Prefer keeping an established cycle driver alive: with
+                // "requester always loses", an unrelated thread that merely holds a query
+                // the driver's evaluation reaches would keep killing the driver, and the
+                // cycle would re-form over and over (ratcheting the inherited iteration
+                // stamp until the iteration cap).
+                let i_am_driving = zalsa_local.query_stack_has_live_cycle_head(zalsa);
+                match zalsa.runtime().cross_cycle_decision(
+                    zalsa,
+                    owner,
+                    database_key_index,
+                    i_am_driving,
+                ) {
+                    Some(wake_key) => {
+                        crate::tracing::debug!(
+                            "{database_key_index:?}: cross-thread cycle; driver wakes {wake_key:?}"
+                        );
+                        zalsa
+                            .runtime()
+                            .unblock_queries_blocked_on(wake_key, crate::runtime::WaitResult::BackOut);
+                        std::thread::yield_now();
+                        return None;
+                    }
+                    None => cycle_loser_unwind(zalsa_local, database_key_index),
+                }
             }
         };
 
@@ -320,7 +348,7 @@ where
 /// `WaitResult::Panicked` (waiters propagate the panic).
 #[cold]
 #[inline(never)]
-fn cycle_loser_unwind(zalsa_local: &ZalsaLocal, database_key_index: DatabaseKeyIndex) -> ! {
+pub(super) fn cycle_loser_unwind(zalsa_local: &ZalsaLocal, database_key_index: DatabaseKeyIndex) -> ! {
     crate::tracing::debug!(
         "{database_key_index:?}: cross-thread cycle detected; unwinding as the losing side"
     );

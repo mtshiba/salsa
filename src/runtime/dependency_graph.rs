@@ -50,6 +50,59 @@ impl DependencyGraph {
         self.edges.depends_on(from_id, to_id)
     }
 
+    /// See `Runtime::cross_cycle_decision`. Walks the block chain `owner -> ... -> me`,
+    /// determining whether any *other* thread on the cycle is driving a fixpoint
+    /// iteration (holds a key whose memo is a current provisional state) and which key
+    /// the current thread holds on the cycle (the predecessor's blocked key).
+    pub(super) fn cross_cycle_walk(
+        &self,
+        zalsa: &crate::zalsa::Zalsa,
+        me: ThreadId,
+        owner: ThreadId,
+        contested_key: DatabaseKeyIndex,
+        i_am_driving: bool,
+    ) -> Option<DatabaseKeyIndex> {
+        let blocked_key_of = |thread: ThreadId| -> Option<DatabaseKeyIndex> {
+            self.query_dependents
+                .iter()
+                .find_map(|(key, dependents)| dependents.contains(&thread).then_some(*key))
+        };
+        let is_driving_state = |key: DatabaseKeyIndex| -> bool {
+            matches!(
+                zalsa
+                    .lookup_ingredient(key.ingredient_index())
+                    .provisional_status(zalsa, key.key_index()),
+                Some(crate::cycle::ProvisionalStatus::Provisional { .. })
+            )
+        };
+
+        // `contested_key` is held by `owner`.
+        let mut other_side_driving = is_driving_state(contested_key);
+        let mut wake_key = None;
+
+        let mut current = owner;
+        while current != me {
+            let edge = self.edges.0.get(&current)?;
+            let key = blocked_key_of(current)?;
+            let key_owner = edge.blocked_on_id;
+            if key_owner == me {
+                wake_key = Some(key);
+            } else if is_driving_state(key) {
+                other_side_driving = true;
+            }
+            current = key_owner;
+        }
+
+        // The driver stays; everyone else yields. If both (or neither) side drives, the
+        // requester yields, which is stable enough because the surviving side finishes
+        // its cycle before the loser's retry can race it again.
+        if i_am_driving && !other_side_driving {
+            wake_key
+        } else {
+            None
+        }
+    }
+
     /// Modifies the graph so that `from_id` is blocked
     /// on `database_key`, which is being computed by
     /// `to_id`.
