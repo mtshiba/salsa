@@ -355,10 +355,12 @@ where
                     }
                 };
                 if let Some(root) = group_root {
-                    zalsa
-                        .runtime()
-                        .cycle_groups()
-                        .add_member(root, database_key_index);
+                    // The contested key is a cycle head by construction.
+                    zalsa.runtime().cycle_groups().add_member(
+                        root,
+                        database_key_index,
+                        [database_key_index],
+                    );
                 }
 
                 let cancellation_count = zalsa.runtime().cancellation_count();

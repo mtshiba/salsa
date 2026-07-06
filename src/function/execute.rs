@@ -113,6 +113,31 @@ where
             memo_ingredient_index,
         );
 
+        // GODE: the thread's cycle group is done once no in-flight frame belongs to it
+        // anymore. This must be checked at every query completion (not only at cycle-head
+        // convergence): the last member frame can finish through ordinary completion when
+        // its cycle was resolved during an inner head's iteration.
+        let zalsa_local = claim_guard.zalsa_local();
+        if let Some(root) = zalsa_local.current_cycle_group() {
+            let groups = zalsa.runtime().cycle_groups();
+            let member_set = groups
+                .members_of(root)
+                .into_iter()
+                .collect::<crate::hash::FxHashSet<_>>();
+            // SAFETY: The stack is not accessed reentrantly.
+            let batch_live = unsafe {
+                zalsa_local.with_query_stack_unchecked(|stack| {
+                    stack
+                        .iter()
+                        .any(|query| member_set.contains(&query.database_key_index))
+                })
+            };
+            if !batch_live {
+                groups.complete(root);
+                zalsa_local.set_current_cycle_group(None);
+            }
+        }
+
         if claim_guard.drop() { None } else { Some(memo) }
     }
 
@@ -297,6 +322,13 @@ where
             let new_cycle_heads = active_query.take_cycle_heads();
             assert_no_new_cycle_heads(&cycle_heads, new_cycle_heads, database_key_index);
 
+            // Snapshot of this head's final coupling for the group ledger;
+            // `try_complete_cycle_head` consumes `cycle_heads`.
+            let head_links = cycle_heads
+                .iter()
+                .map(|head| head.database_key_index)
+                .collect::<Vec<_>>();
+
             let completed_query = match try_complete_cycle_head(
                 active_query,
                 claim_guard,
@@ -308,53 +340,61 @@ where
                 value_converged,
             ) {
                 Ok(completed_query) => {
-                    // GODE: the outermost cycle head converged; the group's provisional
-                    // state becomes final through the normal machinery, so complete the
-                    // group and wake the threads parked on it.
+                    let zalsa_local = claim_guard.zalsa_local();
+                    if let Some(root) = zalsa_local.current_cycle_group() {
+                        // A head folding into an outer cycle stays linked to it; record
+                        // the final coupling (fetch_cold_cycle only recorded the
+                        // self-link at contest time).
+                        if outer_cycle.is_some() {
+                            zalsa.runtime().cycle_groups().add_member(
+                                root,
+                                database_key_index,
+                                head_links.iter().copied(),
+                            );
+                        }
+                    }
                     if outer_cycle.is_none() {
                         let zalsa_local = claim_guard.zalsa_local();
                         if let Some(root) = zalsa_local.current_cycle_group() {
-                            let groups = zalsa.runtime().cycle_groups();
-                            // I-D: converged values must come from an evaluation that
-                            // entered the component at its minimum member; otherwise
-                            // they can depend on which query closed the cycle first.
-                            // Single-member groups are trivially canonical. Discard a
-                            // non-canonical evaluation and redo it detached from the
-                            // canonical entry (see the top-level catch in `fetch`).
-                            let members = groups.members_of(root);
-                            let canonical = members
+                            // I-D: this head is the entry of its converged component
+                            // (its deepest head), and the converged values are a
+                            // function of that entry. Only the component's minimum
+                            // member may finalize it; otherwise discard the evaluation
+                            // and redo it detached from that member (see the top-level
+                            // catch in `fetch`).
+                            let component = zalsa
+                                .runtime()
+                                .cycle_groups()
+                                .component_of(root, database_key_index);
+                            let canonical = component
                                 .iter()
                                 .copied()
                                 .min_by_key(|&key| crate::runtime::cycle_groups::key_order(key))
-                                .unwrap_or(root);
-                            // The entry is the deepest query-stack frame that belongs to
-                            // the group: every on-stack member was hit by a back edge, so
-                            // the member ledger covers them all. The converging head's own
-                            // frame was already popped by `try_complete_cycle_head`, so if
-                            // no member is left on the stack the head itself is the entry.
-                            let is_canonical = members.len() <= 1 || {
-                                let member_set = members
-                                    .iter()
-                                    .copied()
-                                    .collect::<crate::hash::FxHashSet<_>>();
-                                // SAFETY: The stack is not accessed reentrantly.
-                                let entry = unsafe {
-                                    zalsa_local.with_query_stack_unchecked(|stack| {
-                                        stack
-                                            .iter()
-                                            .map(|query| query.database_key_index)
-                                            .find(|key| member_set.contains(key))
-                                    })
-                                }
-                                .unwrap_or(database_key_index);
-                                entry == canonical
-                            };
-                            if !is_canonical {
+                                .expect("component contains at least the head");
+                            // The evaluation's entry into the component: its deepest
+                            // in-flight frame that belongs to it (an enclosing frame may
+                            // still be mid-cycle below us), or this head, whose own
+                            // frame was already popped.
+                            // SAFETY: The stack is not accessed reentrantly.
+                            let entry = unsafe {
+                                zalsa_local.with_query_stack_unchecked(|stack| {
+                                    stack
+                                        .iter()
+                                        .map(|query| query.database_key_index)
+                                        .find(|key| component.contains(key))
+                                })
+                            }
+                            .unwrap_or(database_key_index);
+                            if std::env::var("GODE_DEBUG").is_ok() {
+                                eprintln!(
+                                    "[gode] {} head={database_key_index:?} entry={entry:?} canonical={canonical:?}",
+                                    if entry == canonical { "accept" } else { "restart" },
+                                );
+                            }
+                            if entry != canonical {
                                 zalsa_local.begin_cycle_backout();
                                 Cancelled::CycleCanonicalize { canonical }.throw()
                             }
-                            groups.complete(root);
-                            zalsa_local.set_current_cycle_group(None);
                         }
                     }
                     break (new_value, completed_query);
@@ -830,12 +870,14 @@ fn complete_cycle_participant(
     let zalsa = claim_guard.zalsa();
 
     // GODE: record this query as a member of the thread's current cycle group so an
-    // aborted evaluation can discard its provisional memo.
+    // aborted evaluation can discard its provisional memo, linked to the heads it
+    // read for component scoping.
     if let Some(root) = claim_guard.zalsa_local().current_cycle_group() {
-        zalsa
-            .runtime()
-            .cycle_groups()
-            .add_member(root, active_query.database_key_index);
+        zalsa.runtime().cycle_groups().add_member(
+            root,
+            active_query.database_key_index,
+            cycle_heads.iter().map(|head| head.database_key_index),
+        );
     }
 
     let database_key_index = active_query.database_key_index;

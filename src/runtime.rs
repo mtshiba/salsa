@@ -169,6 +169,10 @@ pub(crate) mod cycle_groups {
         groups: FxHashMap<DatabaseKeyIndex, Arc<GroupState>>,
         /// Member key -> root key of the live group it belongs to.
         member_index: FxHashMap<DatabaseKeyIndex, DatabaseKeyIndex>,
+        /// Member key -> cycle heads it read. Links members into connected
+        /// components: a group is a batch of every cycle met during one evaluation,
+        /// and canonicalization must scope to one component (see `component_of`).
+        member_heads: FxHashMap<DatabaseKeyIndex, Vec<DatabaseKeyIndex>>,
         /// Owner thread -> root key of the live group it is evaluating.
         owner_index: FxHashMap<ThreadId, DatabaseKeyIndex>,
     }
@@ -211,11 +215,69 @@ pub(crate) mod cycle_groups {
             Some(group)
         }
 
-        /// Records `member` as part of the live group rooted at `root`.
-        pub(crate) fn add_member(&self, root: DatabaseKeyIndex, member: DatabaseKeyIndex) {
+        /// Records `member` as part of the live group rooted at `root`, linked to the
+        /// cycle `heads` it read (itself, if the member is a head). Re-recording
+        /// replaces the links: components must reflect the converged dependency
+        /// structure, not couplings from earlier iterations that have since vanished
+        /// (a conditional cycle edge would otherwise keep two components glued
+        /// together and make canonicalization restart forever).
+        pub(crate) fn add_member(
+            &self,
+            root: DatabaseKeyIndex,
+            member: DatabaseKeyIndex,
+            heads: impl IntoIterator<Item = DatabaseKeyIndex>,
+        ) {
             let mut state = self.state.lock();
             debug_assert!(state.groups.contains_key(&root));
             state.member_index.insert(member, root);
+            state.member_heads.insert(member, heads.into_iter().collect());
+        }
+
+        /// The members of `head`'s connected component within the group rooted at
+        /// `root`: the closure of the member–head links. Superset of the strongly
+        /// connected component `head` belongs to, and disjoint from independent
+        /// cycles that merely share the batch; a function of the dependency
+        /// structure, so stable across runs and entry points.
+        pub(crate) fn component_of(
+            &self,
+            root: DatabaseKeyIndex,
+            head: DatabaseKeyIndex,
+        ) -> Vec<DatabaseKeyIndex> {
+            let state = self.state.lock();
+            if std::env::var("GODE_DEBUG").is_ok() {
+                let ledger: Vec<_> = state
+                    .member_heads
+                    .iter()
+                    .filter(|(m, _)| state.member_index.get(m) == Some(&root))
+                    .collect();
+                eprintln!("[ledger] root={root:?} head={head:?} {ledger:?}");
+            }
+            let mut component = vec![head];
+            let mut frontier = vec![head];
+            while let Some(current) = frontier.pop() {
+                for (&member, heads) in &state.member_heads {
+                    if state.member_index.get(&member) != Some(&root) {
+                        continue;
+                    }
+                    if component.contains(&member) {
+                        continue;
+                    }
+                    if heads.contains(&current) || member == current {
+                        component.push(member);
+                        frontier.push(member);
+                    }
+                }
+                // Heads this member read also join the component.
+                if let Some(heads) = state.member_heads.get(&current) {
+                    for &linked in heads {
+                        if !component.contains(&linked) {
+                            component.push(linked);
+                            frontier.push(linked);
+                        }
+                    }
+                }
+            }
+            component
         }
 
         /// The live group that `key` belongs to, if any.
@@ -246,7 +308,18 @@ pub(crate) mod cycle_groups {
         /// machinery; the registry itself has no waiters.
         pub(crate) fn complete(&self, root: DatabaseKeyIndex) {
             let mut state = self.state.lock();
-            state.member_index.retain(|_, r| *r != root);
+            let GroupsState {
+                member_index,
+                member_heads,
+                ..
+            } = &mut *state;
+            member_index.retain(|member, r| {
+                let keep = *r != root;
+                if !keep {
+                    member_heads.remove(member);
+                }
+                keep
+            });
             state.owner_index.retain(|_, r| *r != root);
             state.groups.remove(&root);
         }
